@@ -125,6 +125,7 @@ class Block(linen.Module):
 class DecisionTransformer(linen.Module):
     state_dim: int
     act_dim: int
+    controlled_variables_dim: int
     n_blocks: int
     h_dim: int
     context_len: int
@@ -162,17 +163,11 @@ class DecisionTransformer(linen.Module):
             dtype=self.dtype,
             kernel_init=self.kernel_init,
             bias_init=self.bias_init)(actions) + time_embeddings
-        returns_embeddings = linen.Dense(
-            self.h_dim,
-            dtype=self.dtype,
-            kernel_init=self.kernel_init,
-            bias_init=self.bias_init)(returns_to_go) + time_embeddings
 
-        # stack rtg, states and actions and reshape sequence as
-        # (r_0, s_0, a_0, r_1, s_1, a_1, r_2, s_2, a_2 ...)
-        h = jnp.stack(
-            (returns_embeddings, state_embeddings, action_embeddings), axis=1
-        ).transpose(0, 2, 1, 3).reshape(B, 3 * T, self.h_dim)
+        # concatenate initial state and actions
+        # (s_0, a_0, a_2 ..., a_T)
+        # (B x [T + 1] x h_dim)
+        h = jnp.concatenate((state_embeddings[:,0,:][:,None,:], action_embeddings), axis=1)
 
         h = linen.LayerNorm(dtype=self.dtype)(h)
 
@@ -183,40 +178,20 @@ class DecisionTransformer(linen.Module):
                 max_T=self.input_seq_len,
                 n_heads=self.n_heads,
                 drop_p=self.drop_p)(h)
-        
-        # get h reshaped such that its size = (B x 3 x T x h_dim) and
-        # h[:, 0, t] is conditioned on the input sequence r_0, s_0, a_0 ... r_t
-        # h[:, 1, t] is conditioned on the input sequence r_0, s_0, a_0 ... r_t, s_t
-        # h[:, 2, t] is conditioned on the input sequence r_0, s_0, a_0 ... r_t, s_t, a_t
-        # that is, for each timestep (t) we have 3 output embeddings from the transformer,
-        # each conditioned on all previous timesteps plus 
-        # the 3 input variables at that timestep (r_t, s_t, a_t) in sequence.
-        h = h.reshape(B, T, 3, self.h_dim).transpose(0, 2, 1, 3)
 
         # get predictions
-        return_preds = linen.Dense(
-            1,
+        next_controlled_variable_preds = linen.Dense(
+            self.controlled_variables_dim,
             dtype=self.dtype,
             kernel_init=self.kernel_init,
-            bias_init=self.bias_init)(h[:, 2])     # predict next rtg given r, s, a
-        state_preds = linen.Dense(
-            self.state_dim,
-            dtype=self.dtype,
-            kernel_init=self.kernel_init,
-            bias_init=self.bias_init)(h[:, 2])      # predict next state given r, s, a
-        action_preds = linen.Dense(
-            self.act_dim,
-            dtype=self.dtype,
-            kernel_init=self.kernel_init,
-            bias_init=self.bias_init)(h[:, 1])      # predict action given r, s
-        if self.use_action_tanh:
-            action_preds = jnp.tanh(action_preds)
+            bias_init=self.bias_init)(h[:, 1:])     # predict next controlled variables given s_0, a_0, ..., a_t
 
-        return state_preds, action_preds, return_preds
+        return next_controlled_variable_preds
 
 
 def make_transformer(state_dim: int,
                      act_dim: int,
+                     controlled_variables_dim: int,
                      n_blocks: int,
                      h_dim: int,
                      context_len: int,
@@ -237,6 +212,7 @@ def make_transformer(state_dim: int,
     module = DecisionTransformer(
         state_dim=state_dim,
         act_dim=act_dim,
+        controlled_variables_dim=controlled_variables_dim,
         n_blocks=n_blocks,
         h_dim=h_dim,
         context_len=context_len,
@@ -248,6 +224,7 @@ def make_transformer(state_dim: int,
 
 def make_policy_networks(state_dim: int,
                          act_dim: int,
+                         controlled_variables_dim: int,
                          n_blocks: int,
                          h_dim: int,
                          context_len: int,
@@ -267,15 +244,16 @@ def make_policy_networks(state_dim: int,
                          states: jnp.ndarray,
                          actions: jnp.ndarray,
                          returns_to_go: jnp.ndarray):
-                s_ps, a_ps, r_ps = make_transformer(
+                y_ps = make_transformer(
                     state_dim=state_dim,
                     act_dim=act_dim,
+                    controlled_variables_dim=controlled_variables_dim,
                     n_blocks=n_blocks,
                     h_dim=h_dim,
                     context_len=context_len,
                     n_heads=n_heads,
                     drop_p=drop_p)(timesteps, states, actions, returns_to_go)
-                return s_ps, a_ps, r_ps
+                return y_ps
 
         policy_module = PolicyModule()
         policy = FeedForwardModel(

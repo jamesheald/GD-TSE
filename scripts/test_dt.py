@@ -1,5 +1,6 @@
 import argparse
-import gym
+#import gym
+import gymnasium as gym
 import jax
 import os
 import random
@@ -22,7 +23,8 @@ def test(args):
         eval_env_d4rl_name = f'walker2d-{eval_dataset}-v2'
 
     elif args.env == 'halfcheetah':
-        eval_env_name = 'HalfCheetah-v3'
+        #eval_env_name = 'HalfCheetah-v3'
+        eval_env_name = 'HalfCheetah-v4'
         eval_rtg_target = args.rtg_target if args.rtg_target is not None else 6000
         eval_env_d4rl_name = f'halfcheetah-{eval_dataset}-v2'
 
@@ -52,7 +54,7 @@ def test(args):
     # seed for others
     random.seed(seed)
     np.random.seed(seed)
-    eval_env.seed(seed)
+    #eval_env.seed(seed)
 
     render = args.render                # render the env frames
 

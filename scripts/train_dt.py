@@ -2,7 +2,8 @@ import argparse
 import csv
 import flax
 import functools
-import gym
+#import gym
+import gymnasium as gym
 import jax
 import optax
 import os
@@ -16,9 +17,11 @@ import numpy as np
 from datetime import datetime
 from typing import Any, Dict, Tuple
 
+from functools import partial
+
 from decision_transformer.dt.model import make_policy_networks
 from decision_transformer.dt.utils import ReplayBuffer, TrainingState, Transition
-from decision_transformer.dt.utils import discount_cumsum, evaluate_on_env, get_d4rl_normalized_score, save_params
+from decision_transformer.dt.utils import discount_cumsum, save_params
 from decision_transformer.pmap import bcast_local_devices, synchronize_hosts, is_replicated
 
 def train(args):
@@ -35,7 +38,8 @@ def train(args):
         env_d4rl_name = f'walker2d-{dataset}-v2'
 
     elif args.env == 'halfcheetah':
-        env_name = 'HalfCheetah-v3'
+        #env_name = 'HalfCheetah-v3'
+        env_name = 'HalfCheetah-v4'
         rtg_target = args.rtg_target if args.rtg_target is not None else 6000
         env_d4rl_name = f'halfcheetah-{dataset}-v2'
 
@@ -68,10 +72,7 @@ def train(args):
     # seed for others
     random.seed(seed)
     np.random.seed(seed)
-    env.seed(seed)
-
-    max_eval_ep_len = args.max_eval_ep_len  # max len of one episode
-    num_eval_ep = args.num_eval_ep          # num of evaluation episodes
+    #env.seed(seed)
 
     batch_size = args.batch_size            # training batch size
     batch_size_per_device = batch_size // local_devices_to_use
@@ -92,6 +93,7 @@ def train(args):
     dropout_p = args.dropout_p          # dropout probability
 
     # load data from this file
+    env_d4rl_name = 'relocate-expert-v1'
     dataset_path = f'{args.dataset_dir}/{env_d4rl_name}.pkl'
 
     # saves model and csv in this directory
@@ -119,10 +121,7 @@ def train(args):
     csv_header = ([
         "duration",
         "num_updates",
-        "action_loss",
-        "eval_avg_reward",
-        "eval_avg_ep_len",
-        "eval_d4rl_score"
+        "action_loss"
     ])
 
     csv_writer.writerow(csv_header)
@@ -139,19 +138,17 @@ def train(args):
     with open(dataset_path, 'rb') as f:
         trajectories = pickle.load(f)
 
-    state_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-    trans_dim = state_dim + act_dim + 1 + 1 + 1  # rtg, timesteps, mask
-
     # to get status
     max_epi_len = -1
     min_epi_len = 10**6
     state_stats = []
+    next_controlled_variables_stats = []
     for traj in trajectories:
         traj_len = traj['observations'].shape[0]
         min_epi_len = min(min_epi_len, traj_len)
         max_epi_len = max(max_epi_len, traj_len)
         state_stats.append(traj['observations'])
+        next_controlled_variables_stats.append(traj['next_controlled_variables'])
         # convert
         traj['actions'] = jnp.array(traj['actions'])
         traj['observations'] = jnp.array(traj['observations'])
@@ -164,24 +161,37 @@ def train(args):
     state_stats = jnp.concatenate(state_stats, axis=0)
     state_mean, state_std = jnp.mean(state_stats, axis=0), jnp.std(state_stats, axis=0) + 1e-8
 
+    next_controlled_variables_stats = np.concatenate(next_controlled_variables_stats, axis=0)
+    controlled_variables_mean, controlled_variables_std = np.mean(next_controlled_variables_stats, axis=0), np.std(next_controlled_variables_stats, axis=0) + 1e-6
+    controlled_variables_dim = next_controlled_variables_stats.shape[-1]
+
+    # state_dim = env.observation_space.shape[0]
+    # act_dim = env.action_space.shape[0]
+    state_dim = trajectories[0]['observations'].shape[1]
+    act_dim = trajectories[0]['actions'].shape[1]
+    trans_dim = state_dim + act_dim + controlled_variables_dim + 1 + 1 + 1  # rtg, timesteps, mask
+
     # apply padding
     replay_buffer_data = []
     for traj in trajectories:
         traj_len = traj['observations'].shape[0]
         padding_len = (max_epi_len + context_len) - traj_len
         states = traj['observations']
+        next_controlled_variables = traj['next_controlled_variables']
 
         # apply input normalization
         if not args.rm_normalization:
             states = (states - state_mean) / state_std
+            next_controlled_variables = (next_controlled_variables - controlled_variables_mean) / controlled_variables_std
 
         states = jnp.concatenate([states, jnp.zeros((padding_len, state_dim))], axis=0)
         actions = jnp.concatenate([traj['actions'], jnp.zeros((padding_len, act_dim))], axis=0)
+        next_controlled_variables = jnp.concatenate([next_controlled_variables, jnp.zeros((padding_len, controlled_variables_dim))], axis=0)
         returns_to_go = jnp.concatenate([traj['returns_to_go'], jnp.zeros((padding_len, 1))], axis=0)
         timesteps = jnp.concatenate([traj['timesteps'], jnp.zeros((padding_len, 1))], axis=0)
         traj_mask = jnp.concatenate([traj['traj_mask'], jnp.zeros((padding_len, 1))], axis=0)
 
-        padding_data = jnp.concatenate([states, actions, returns_to_go, timesteps, traj_mask], axis=-1)
+        padding_data = jnp.concatenate([states, actions, next_controlled_variables, returns_to_go, timesteps, traj_mask], axis=-1)
         assert trans_dim == padding_data.shape[-1], padding_data.shape
         replay_buffer_data.append(padding_data)
 
@@ -192,6 +202,7 @@ def train(args):
     policy_model = make_policy_networks(
         state_dim=state_dim,
         act_dim=act_dim,
+        controlled_variables_dim=controlled_variables_dim,
         n_blocks=n_blocks,
         h_dim=embed_dim,
         context_len=context_len,
@@ -215,29 +226,30 @@ def train(args):
     policy_optimizer_state = policy_optimizer.init(policy_params)
 
     # count the number of parameters
-    param_count = sum(x.size for x in jax.tree_leaves(policy_params))
+    param_count = sum(x.size for x in jax.tree_util.tree_leaves(policy_params))
     print(f'num_policy_param: {param_count}')
 
     policy_optimizer_state, policy_params = bcast_local_devices(
         (policy_optimizer_state, policy_params), local_devices_to_use)
 
-    def actor_loss(policy_params: Any,
+    def transformer_loss(policy_params: Any,
                    transitions: Transition, key: jnp.ndarray) -> jnp.ndarray:
         ts = transitions.ts.reshape(transitions.ts.shape[:2]).astype(jnp.int32)  # (batch_size_per_device, context_len)
         s_t = transitions.s_t  # (batch_size_per_device, context_len, state_dim)
         a_t = transitions.a_t  # (batch_size_per_device, context_len, action_dim)
+        y_t = transitions.y_t  # (batch_size_per_device, context_len, controlled_variables_dim)
         rtg_t = transitions.rtg_t  # (batch_size_per_device, context_len, 1)
         mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
-        _, a_p, _ = policy_model.apply(policy_params, ts, s_t, a_t, rtg_t, rngs={'dropout': key})
+        y_p = policy_model.apply(policy_params, ts, s_t, a_t, rtg_t, rngs={'dropout': key})
 
-        a_t = jnp.where(mask.reshape(-1, 1) > 0, a_t.reshape(-1, act_dim), jnp.zeros(()))
-        a_p = jnp.where(mask.reshape(-1, 1) > 0, a_p.reshape(-1, act_dim), jnp.zeros(()))
+        y_t = jnp.where(mask.reshape(-1, 1) > 0, y_t.reshape(-1, controlled_variables_dim), jnp.zeros(()))
+        y_p = jnp.where(mask.reshape(-1, 1) > 0, y_p.reshape(-1, controlled_variables_dim), jnp.zeros(()))
 
-        actor_loss = jnp.mean(jnp.square(a_t - a_p))
+        transformer_loss = jnp.mean(jnp.square(y_t - y_p))
 
-        return actor_loss
+        return transformer_loss
 
-    actor_grad = jax.jit(jax.value_and_grad(actor_loss))
+    transformer_grad = jax.jit(jax.value_and_grad(transformer_loss))
 
     @jax.jit
     def update_step(
@@ -245,23 +257,26 @@ def train(args):
         transitions: jnp.ndarray,
     ) -> Tuple[TrainingState, bool, Dict[str, jnp.ndarray]]:
 
+        cumsum_dims = np.cumsum([state_dim, act_dim, controlled_variables_dim, 1, 1, 1])
+
         transitions = Transition(
-            s_t=transitions[:, :, :state_dim],
-            a_t=transitions[:, :, state_dim:state_dim+act_dim],
-            rtg_t=transitions[:, :, state_dim+act_dim:state_dim+act_dim+1],
-            ts=transitions[:, :, state_dim+act_dim+1:state_dim+act_dim+1+1],
-            mask_t=transitions[:, :, state_dim+act_dim+1+1:state_dim+act_dim+1+1+1]
+            s_t=transitions[:, :, :cumsum_dims[0]],
+            a_t=transitions[:, :, cumsum_dims[0]:cumsum_dims[1]],
+            y_t=transitions[:, :, cumsum_dims[1]:cumsum_dims[2]],
+            rtg_t=transitions[:, :, cumsum_dims[2]:cumsum_dims[3]],
+            ts=transitions[:, :, cumsum_dims[3]:cumsum_dims[4]],
+            mask_t=transitions[:, :, cumsum_dims[4]:cumsum_dims[5]]
         )
 
         key, key_actor = jax.random.split(state.key, 2)
 
-        actor_loss, actor_grads = actor_grad(state.policy_params, transitions, key_actor)
-        actor_grads = jax.lax.pmean(actor_grads, axis_name='i')
+        transformer_loss, transformer_grads = transformer_grad(state.policy_params, transitions, key_actor)
+        transformer_grads = jax.lax.pmean(transformer_grads, axis_name='i')
         policy_params_update, policy_optimizer_state = policy_optimizer.update(
-            actor_grads, state.policy_optimizer_state, state.policy_params)
+            transformer_grads, state.policy_optimizer_state, state.policy_params)
         policy_params = optax.apply_updates(state.policy_params, policy_params_update)
 
-        metrics = {'actor_loss': actor_loss}
+        metrics = {'transformer_loss': transformer_loss}
 
         new_state = TrainingState(
             policy_optimizer_state=policy_optimizer_state,
@@ -270,7 +285,7 @@ def train(args):
             actor_steps=state.actor_steps + 1)
         return new_state, metrics
 
-    def sample_data(training_state, replay_buffer):
+    def sample_data(training_state, replay_buffer, max_epi_len):
         # num_updates_per_iter
         key1, key2, key3 = jax.random.split(training_state.key, 3)
         epi_idx = jax.random.randint(
@@ -280,7 +295,7 @@ def train(args):
         context_idx = jax.random.randint(
             key2, (int(batch_size_per_device*grad_updates_per_step),),
             minval=0,
-            maxval=replay_buffer.data.shape[1])  # from (0, max_epi_len)
+            maxval=max_epi_len)  # from (0, max_epi_len)
 
         def dynamic_slice_context(carry, x):
             traj, c_idx = x
@@ -297,24 +312,24 @@ def train(args):
         training_state = training_state.replace(key=key3)
         return training_state, transitions
 
-    def run_one_epoch(carry, unused_t):
+    def run_one_epoch(carry, unused_t, max_epi_len):
         training_state, replay_buffer = carry
 
-        training_state, transitions = sample_data(training_state, replay_buffer)
+        training_state, transitions = sample_data(training_state, replay_buffer, max_epi_len)
         training_state, metrics = jax.lax.scan(
             update_step, training_state, transitions, length=1)
         return (training_state, replay_buffer), metrics
 
-    def run_training(training_state, replay_buffer):
+    def run_training(training_state, replay_buffer, max_epi_len):
         synchro = is_replicated(
             training_state.replace(key=jax.random.PRNGKey(0)), axis_name='i')
         (training_state, replay_buffer), metrics = jax.lax.scan(
-            run_one_epoch, (training_state, replay_buffer), (),
+            partial(run_one_epoch, max_epi_len=max_epi_len), (training_state, replay_buffer), (),
             length=num_updates_per_iter)
-        metrics = jax.tree_map(jnp.mean, metrics)
+        metrics = jax.tree_util.tree_map(jnp.mean, metrics)
         return training_state, replay_buffer, metrics, synchro
     
-    run_training = jax.pmap(run_training, axis_name='i')
+    run_training = jax.pmap(partial(run_training, max_epi_len=max_epi_len), axis_name='i')
 
     training_state = TrainingState(
         policy_optimizer_state=policy_optimizer_state,
@@ -332,25 +347,8 @@ def train(args):
         training_state, replay_buffer, training_metrics, synchro = run_training(
             training_state, replay_buffer)
         assert synchro[0], (current_step, training_state)
-        jax.tree_map(lambda x: x.block_until_ready(), training_metrics)
-        log_action_losses.append(training_metrics['actor_loss'])
-
-        # evaluate action accuracy
-        results = evaluate_on_env(policy_model,
-                                  training_state.policy_params,
-                                  test_key,
-                                  context_len,
-                                  env,
-                                  rtg_target,
-                                  rtg_scale,
-                                  num_eval_ep,
-                                  max_eval_ep_len,
-                                  state_mean,
-                                  state_std)
-
-        eval_avg_reward = results['eval/avg_reward']
-        eval_avg_ep_len = results['eval/avg_ep_len']
-        eval_d4rl_score = get_d4rl_normalized_score(results['eval/avg_reward'], env_name) * 100
+        jax.tree_util.tree_map(lambda x: x.block_until_ready(), training_metrics)
+        log_action_losses.append(training_metrics['transformer_loss'])
 
         mean_action_loss = np.mean(log_action_losses)
         time_elapsed = str(datetime.now().replace(microsecond=0) - start_time)
@@ -361,10 +359,7 @@ def train(args):
                    "time elapsed: " + time_elapsed  + '\n' +
                    "train iter: " + str(i_train_iter)  + '\n' +
                    "num of updates: " + str(total_updates) + '\n' +
-                   "action loss: " +  format(mean_action_loss, ".5f") + '\n' +
-                   "eval avg reward: " + format(eval_avg_reward, ".5f") + '\n' +
-                   "eval avg ep len: " + format(eval_avg_ep_len, ".5f") + '\n' +
-                   "eval d4rl score: " + format(eval_d4rl_score, ".5f")
+                   "action loss: " +  format(mean_action_loss, ".5f") + '\n'
                 )
 
         print(log_str)
@@ -373,20 +368,12 @@ def train(args):
             time_elapsed,
             total_updates,
             mean_action_loss,
-            eval_avg_reward,
-            eval_avg_ep_len,
-            eval_d4rl_score
         ]
 
         csv_writer.writerow(log_data)
 
         # save model
-        _policy_params = jax.tree_map(lambda x: x[0], training_state.policy_params)
-        print("max d4rl score: " + format(max_d4rl_score, ".5f"))
-        if eval_d4rl_score >= max_d4rl_score:
-            print("saving max d4rl score model at: " + save_best_model_path)
-            save_params(save_best_model_path, _policy_params)
-            max_d4rl_score = eval_d4rl_score
+        _policy_params = jax.tree_util.tree_map(lambda x: x[0], training_state.policy_params)
 
         if i_train_iter % args.policy_save_iters == 0 or i_train_iter == max_train_iters - 1:
             save_current_model_path = save_model_path[:-3] + f"_{total_updates}.pt"
@@ -419,9 +406,6 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', type=str, default='medium')
     parser.add_argument('--rtg_scale', type=int, default=1000)
     parser.add_argument('--rtg_target', type=int, default=None)
-
-    parser.add_argument('--max_eval_ep_len', type=int, default=1000)
-    parser.add_argument('--num_eval_ep', type=int, default=10)
 
     parser.add_argument('--dataset_dir', type=str, default='data/')
     parser.add_argument('--log_dir', type=str, default='dt_runs/')
