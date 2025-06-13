@@ -19,6 +19,10 @@ from typing import Any, Dict, Tuple
 
 from functools import partial
 
+import wandb
+import tensorflow_probability.substrates.jax as tfp
+tfd = tfp.distributions
+
 from decision_transformer.dt.model import make_policy_networks
 from decision_transformer.dt.utils import ReplayBuffer, TrainingState, Transition
 from decision_transformer.dt.utils import discount_cumsum, save_params
@@ -242,10 +246,29 @@ def train(args):
         mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
         y_p = policy_model.apply(policy_params, ts, s_t, a_t, rtg_t, rngs={'dropout': key})
 
-        y_t = jnp.where(mask.reshape(-1, 1) > 0, y_t.reshape(-1, controlled_variables_dim), jnp.zeros(()))
-        y_p = jnp.where(mask.reshape(-1, 1) > 0, y_p.reshape(-1, controlled_variables_dim), jnp.zeros(()))
+        def true_fn(y_mean, y_log_std, y_t):
+            dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
+            return dist.log_prob(y_t)
 
-        transformer_loss = jnp.mean(jnp.square(y_t - y_p))
+        def false_fn(y_mean, y_log_std, y_t):
+            return 0.
+        
+        def get_log_prob(mask, y_mean, y_log_std, y_t):
+            log_prob = jax.lax.cond(mask, true_fn, false_fn, y_mean, y_log_std, y_t)
+            return log_prob
+        batch_get_log_prob = jax.vmap(get_log_prob)
+
+        y_mean, y_log_std = jnp.split(y_p, 2, axis=-1)
+        min_log_std = -20.
+        max_log_std = 2.
+        y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
+        y_mean = y_mean.reshape(-1, controlled_variables_dim)
+        y_log_std = y_log_std.reshape(-1, controlled_variables_dim)
+        y_t = y_t.reshape(-1, controlled_variables_dim)
+        
+        log_probs = batch_get_log_prob((mask.reshape(-1, 1) > 0).squeeze(-1), y_mean, y_log_std, y_t)
+
+        transformer_loss = jnp.mean(-log_probs)
 
         return transformer_loss
 
@@ -340,6 +363,13 @@ def train(args):
     max_d4rl_score = -1.0
     total_updates = 0
 
+    wandb.init(
+            name=f'{env_d4rl_name}-{random.randint(int(1e5), int(1e6) - 1)}',
+            group=env_d4rl_name,
+            project='jax_dt',
+            config=args
+        )
+
     for i_train_iter in range(max_train_iters):
         log_action_losses = []
 
@@ -363,6 +393,8 @@ def train(args):
                 )
 
         print(log_str)
+
+        wandb.log({'mean_action_loss': mean_action_loss})
 
         log_data = [
             time_elapsed,
@@ -423,7 +455,7 @@ if __name__ == "__main__":
     parser.add_argument('--wt_decay', type=float, default=1e-4)
     parser.add_argument('--warmup_steps', type=int, default=10000)
 
-    parser.add_argument('--max_train_iters', type=int, default=200)
+    parser.add_argument('--max_train_iters', type=int, default=1_000)
     parser.add_argument('--num_updates_per_iter', type=int, default=100)
     parser.add_argument('--policy_save_iters', type=int, default=10)
     parser.add_argument('--rm_normalization', action='store_true', help='Turn off input normalization')

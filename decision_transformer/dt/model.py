@@ -181,13 +181,12 @@ class DecisionTransformer(linen.Module):
 
         # get predictions
         next_controlled_variable_preds = linen.Dense(
-            self.controlled_variables_dim,
+            self.controlled_variables_dim*2,
             dtype=self.dtype,
             kernel_init=self.kernel_init,
             bias_init=self.bias_init)(h[:, 1:])     # predict next controlled variables given s_0, a_0, ..., a_t
 
         return next_controlled_variable_preds
-
 
 def make_transformer(state_dim: int,
                      act_dim: int,
