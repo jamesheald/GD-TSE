@@ -23,7 +23,7 @@ import wandb
 import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
 
-from decision_transformer.dt.model import make_policy_networks
+from decision_transformer.dt.model import make_transformer_networks
 from decision_transformer.dt.utils import ReplayBuffer, TrainingState, Transition
 from decision_transformer.dt.utils import discount_cumsum, save_params
 from decision_transformer.pmap import bcast_local_devices, synchronize_hosts, is_replicated
@@ -155,6 +155,7 @@ def train(args):
         # convert
         traj['actions'] = jnp.array(traj['actions'])
         traj['observations'] = jnp.array(traj['observations'])
+        traj['next_controlled_variables'] = jnp.array(traj['next_controlled_variables'])
         # calculate returns to go and rescale them
         traj['returns_to_go'] = jnp.array(discount_cumsum(traj['rewards'], 1.0) / rtg_scale).reshape(-1, 1)
         traj['timesteps'] = jnp.arange(start=0, stop=traj_len, step=1, dtype=jnp.int32).reshape(-1, 1)
@@ -164,8 +165,8 @@ def train(args):
     state_stats = jnp.concatenate(state_stats, axis=0)
     state_mean, state_std = jnp.mean(state_stats, axis=0), jnp.std(state_stats, axis=0) + 1e-8
 
-    next_controlled_variables_stats = np.concatenate(next_controlled_variables_stats, axis=0)
-    controlled_variables_mean, controlled_variables_std = np.mean(next_controlled_variables_stats, axis=0), np.std(next_controlled_variables_stats, axis=0) + 1e-6
+    next_controlled_variables_stats = jnp.concatenate(next_controlled_variables_stats, axis=0)
+    controlled_variables_mean, controlled_variables_std = jnp.mean(next_controlled_variables_stats, axis=0), jnp.std(next_controlled_variables_stats, axis=0) + 1e-6
     controlled_variables_dim = next_controlled_variables_stats.shape[-1]
 
     # state_dim = env.observation_space.shape[0]
@@ -202,7 +203,7 @@ def train(args):
         data=jnp.concatenate(replay_buffer_data, axis=0).reshape(local_devices_to_use, -1, max_epi_len + context_len, trans_dim)
     ) # (local_devices_to_use, num_epi, max_epi_len + context_len, trans_dim)
 
-    policy_model = make_policy_networks(
+    policy_model = make_transformer_networks(
         state_dim=state_dim,
         act_dim=act_dim,
         controlled_variables_dim=controlled_variables_dim,
