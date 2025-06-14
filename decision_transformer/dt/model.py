@@ -269,7 +269,7 @@ class EncoderTransformer(linen.Module):
 
         return latent_preds
     
-class PrecoderTransformer(linen.Module):
+class Transformer(linen.Module):
     state_dim: int
     act_dim: int
     controlled_variables_dim: int
@@ -283,9 +283,10 @@ class PrecoderTransformer(linen.Module):
     use_action_tanh: bool = True
     kernel_init: Callable[..., Any] = lecun_normal()
     bias_init: Callable[..., Any] = zeros
+    transformer_type: str = 'dynamics' # 'encoder', 'precoder' or 'dynamics'
 
     def setup(self):
-        self.input_seq_len = 3 * self.context_len
+        None
     
     @linen.compact
     def __call__(self,
@@ -298,31 +299,60 @@ class PrecoderTransformer(linen.Module):
         B, T, _ = states.shape
 
         positions = jnp.arange(self.context_len+1)[None,:].repeat(states.shape[0], axis=0)
-        time_embeddings = linen.Embed(
+        positional_embeddings = linen.Embed(
             num_embeddings=self.context_len+1,
             features=self.h_dim)(positions)
 
-        # time embeddings are treated similar to positional embeddings
         initial_state_embedding = linen.Dense(
             self.h_dim,
             dtype=self.dtype,
             kernel_init=self.kernel_init,
-            bias_init=self.bias_init)(states[:,0,:]) + time_embeddings[:,0,:]
-        latent_embedding = linen.Dense(
-            self.h_dim,
-            dtype=self.dtype,
-            kernel_init=self.kernel_init,
-            bias_init=self.bias_init)(latent) + time_embeddings[:,1,:]
-        action_embeddings = linen.Dense(
-            self.h_dim,
-            dtype=self.dtype,
-            kernel_init=self.kernel_init,
-            bias_init=self.bias_init)(actions) + time_embeddings[:,2:,:]
+            bias_init=self.bias_init)(states[:,0,:]) + positional_embeddings[:,0,:]
 
-        # concatenate initial state and controlled variables
-        # (s_0, z_0, a_1, ..., y_t)
-        # (B x [T + 1] x h_dim)
-        h = jnp.concatenate((initial_state_embedding[:,None,:], latent_embedding[:,None,:], action_embeddings), axis=1)
+        if self.transformer_type == 'encoder': # infer latent variable z_0 given s_0, y_1, ..., y_H
+            
+            controlled_variables_embeddings = linen.Dense(
+                self.h_dim,
+                dtype=self.dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init)(next_controlled_variables) + positional_embeddings[:,1:,:]
+            
+            # concatenate initial state and controlled variables
+            # (s_0, y_1, ..., y_H)
+            # (B x [T + 1] x h_dim)
+            h = jnp.concatenate((initial_state_embedding[:,None,:], controlled_variables_embeddings), axis=1)
+        
+        elif self.transformer_type == 'precoder': # generate action variable a_t given s_0, z_0, a_0, ..., a_t-1
+            
+            latent_embedding = linen.Dense(
+                self.h_dim,
+                dtype=self.dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init)(latent) + positional_embeddings[:,1,:]
+            
+            action_embeddings = linen.Dense(
+                self.h_dim,
+                dtype=self.dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init)(actions) + positional_embeddings[:,2:,:]
+            
+            # concatenate initial state, latent and actions
+            # (s_0, z_0, a_1, ..., a_t)
+            # (B x [T + 1] x h_dim)
+            h = jnp.concatenate((initial_state_embedding[:,None,:], latent_embedding[:,None,:], action_embeddings), axis=1)
+
+        elif self.transformer_type == 'dynamics': # predict next controlled variables given s_0, a_0, ..., a_t
+           
+            action_embeddings = linen.Dense(
+                self.h_dim,
+                dtype=self.dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init)(actions) + positional_embeddings[:,1:,:]
+            
+            # concatenate initial state and actions
+            # (s_0, a_0, a_2 ..., a_T)
+            # (B x [T + 1] x h_dim)
+            h = jnp.concatenate((initial_state_embedding[:,None,:], action_embeddings), axis=1)
 
         h = linen.LayerNorm(dtype=self.dtype)(h)
 
@@ -330,18 +360,30 @@ class PrecoderTransformer(linen.Module):
         for _ in range(self.n_blocks):
             h = Block(
                 h_dim=self.h_dim,
-                max_T=self.input_seq_len,
+                max_T=self.context_len+1,
                 n_heads=self.n_heads,
-                drop_p=self.drop_p)(h)
+                drop_p=self.drop_p,
+                use_causal_mask=False if self.transformer_type == 'encoder' else True)(h)
             
-        # get predictions
-        action_out = linen.Dense(
-            self.act_dim,
+        if self.transformer_type == 'encoder':
+            # pool token embeddings
+            h = jnp.mean(h, axis=1)
+            output_dim = self.controlled_variables_dim * 2
+        elif self.transformer_type == 'precoder':
+            h = h[:, 1:]
+            output_dim = self.act_dim
+        elif self.transformer_type == 'dynamics':
+            h = h[:, 1:]
+            output_dim = self.controlled_variables_dim * 2
+            
+        # get outputs
+        output = linen.Dense(
+            output_dim,
             dtype=self.dtype,
             kernel_init=self.kernel_init,
-            bias_init=self.bias_init)(h)     # predict action variable a_t given s_0, z_0, a_0, ..., a_t-1
+            bias_init=self.bias_init)(h)
 
-        return action_out
+        return output
 
 def make_transformer(state_dim: int,
                      act_dim: int,
@@ -350,8 +392,9 @@ def make_transformer(state_dim: int,
                      h_dim: int,
                      context_len: int,
                      n_heads: int,
-                     drop_p: float) -> DynamicsTransformer:
-    """Creates a DynamicsTransformer model.
+                     drop_p: float,
+                     transformer_type: str) -> Transformer:
+    """Creates a Transformer model.
     Args:
         state_dim: dimension of state
         act_dim: dimension of action
@@ -363,7 +406,7 @@ def make_transformer(state_dim: int,
     Returns:
         a model
     """
-    module = DynamicsTransformer(
+    module = Transformer(
         state_dim=state_dim,
         act_dim=act_dim,
         controlled_variables_dim=controlled_variables_dim,
@@ -371,7 +414,8 @@ def make_transformer(state_dim: int,
         h_dim=h_dim,
         context_len=context_len,
         n_heads=n_heads,
-        drop_p=drop_p)
+        drop_p=drop_p,
+        transformer_type=transformer_type)
 
     return module
 
@@ -383,11 +427,14 @@ def make_transformer_networks(state_dim: int,
                               h_dim: int,
                               context_len: int,
                               n_heads: int,
-                              drop_p: float) -> FeedForwardModel:
+                              drop_p: float,
+                              transformer_type: str) -> FeedForwardModel:
     batch_size = 1
     dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
     dummy_states = jnp.zeros((batch_size, context_len, state_dim))
+    dummy_latent = jnp.zeros((batch_size, context_len, controlled_variables_dim))
     dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
+    dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
     dummy_rtg = jnp.zeros((batch_size, context_len, 1))
 
     def policy_model_fn():
@@ -396,9 +443,11 @@ def make_transformer_networks(state_dim: int,
             def __call__(self,
                          timesteps: jnp.ndarray,
                          states: jnp.ndarray,
+                         latent: jnp.ndarray,
                          actions: jnp.ndarray,
+                         next_controlled_variables: jnp.ndarray,
                          returns_to_go: jnp.ndarray):
-                y_ps = make_transformer(
+                outputs = make_transformer(
                     state_dim=state_dim,
                     act_dim=act_dim,
                     controlled_variables_dim=controlled_variables_dim,
@@ -406,13 +455,14 @@ def make_transformer_networks(state_dim: int,
                     h_dim=h_dim,
                     context_len=context_len,
                     n_heads=n_heads,
-                    drop_p=drop_p)(timesteps, states, actions, returns_to_go)
-                return y_ps
+                    drop_p=drop_p,
+                    transformer_type=transformer_type)(timesteps, states, latent, actions, next_controlled_variables, returns_to_go)
+                return outputs
 
         policy_module = PolicyModule()
         policy = FeedForwardModel(
             init=lambda key: policy_module.init(
-                key, dummy_timesteps, dummy_states, dummy_actions, dummy_rtg),
+                key, dummy_timesteps, dummy_states, dummy_latent, dummy_actions,dummy_controlled_variables, dummy_rtg),
             apply=policy_module.apply)
         return policy
     return policy_model_fn()

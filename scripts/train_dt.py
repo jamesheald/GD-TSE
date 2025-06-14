@@ -212,6 +212,7 @@ def train(args):
         context_len=context_len,
         n_heads=n_heads,
         drop_p=dropout_p,
+        transformer_type='dynamics'
     )
 
     schedule_fn = optax.polynomial_schedule(
@@ -244,7 +245,8 @@ def train(args):
         y_t = transitions.y_t  # (batch_size_per_device, context_len, controlled_variables_dim)
         rtg_t = transitions.rtg_t  # (batch_size_per_device, context_len, 1)
         mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
-        y_p = policy_model.apply(policy_params, ts, s_t, a_t, rtg_t, rngs={'dropout': key})
+
+        y_p = policy_model.apply(policy_params, ts, s_t, y_t, a_t, y_t, rtg_t, rngs={'dropout': key})
 
         def true_fn(y_mean, y_log_std, y_t):
             dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
