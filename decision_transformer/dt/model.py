@@ -148,26 +148,31 @@ class DecisionTransformer(linen.Module):
                  returns_to_go: jnp.ndarray) -> jnp.ndarray:
         B, T, _ = states.shape
 
+        # time_embeddings = linen.Embed(
+        #     num_embeddings=self.max_timestep,
+        #     features=self.h_dim)(timesteps)
+
+        positions = jnp.arange(self.context_len+1)[None,:].repeat(states.shape[0], axis=0)
         time_embeddings = linen.Embed(
-            num_embeddings=self.max_timestep,
-            features=self.h_dim)(timesteps)
+            num_embeddings=self.context_len+1,
+            features=self.h_dim)(positions)
 
         # time embeddings are treated similar to positional embeddings
-        state_embeddings = linen.Dense(
+        initial_state_embedding = linen.Dense(
             self.h_dim,
             dtype=self.dtype,
             kernel_init=self.kernel_init,
-            bias_init=self.bias_init)(states) + time_embeddings
+            bias_init=self.bias_init)(states[:,0,:]) + time_embeddings[:,0,:]
         action_embeddings = linen.Dense(
             self.h_dim,
             dtype=self.dtype,
             kernel_init=self.kernel_init,
-            bias_init=self.bias_init)(actions) + time_embeddings
+            bias_init=self.bias_init)(actions) + time_embeddings[:,1:,:]
 
         # concatenate initial state and actions
         # (s_0, a_0, a_2 ..., a_T)
         # (B x [T + 1] x h_dim)
-        h = jnp.concatenate((state_embeddings[:,0,:][:,None,:], action_embeddings), axis=1)
+        h = jnp.concatenate((initial_state_embedding[:,None,:], action_embeddings), axis=1)
 
         h = linen.LayerNorm(dtype=self.dtype)(h)
 

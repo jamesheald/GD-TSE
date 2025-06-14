@@ -98,8 +98,7 @@ def train(args):
 
     # load data from this file
     env_d4rl_name = 'relocate-expert-v1'
-    dataset_path = f'{args.dataset_dir}/{env_d4rl_name}.pkl'
-
+    dataset_path = f'{args.dataset_dir}/{env_d4rl_name}-qpos.pkl'
     # saves model and csv in this directory
     log_dir = args.log_dir
     if not os.path.exists(log_dir):
