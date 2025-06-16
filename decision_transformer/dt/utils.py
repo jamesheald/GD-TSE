@@ -43,10 +43,10 @@ class Transition:
 @flax.struct.dataclass
 class TrainingState:
     """Contains training state for the learner."""
-    policy_optimizer_state: optax.OptState
-    policy_params: Any
+    optimizer_state: optax.OptState
+    params: Any
     key: jnp.ndarray
-    actor_steps: jnp.ndarray
+    steps: jnp.ndarray
 
 
 class File:

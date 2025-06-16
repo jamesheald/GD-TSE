@@ -23,7 +23,7 @@ import wandb
 import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
 
-from decision_transformer.dt.model import make_transformer_networks
+from decision_transformer.dt.model import make_transformer_networks, VAE
 from decision_transformer.dt.utils import ReplayBuffer, TrainingState, Transition
 from decision_transformer.dt.utils import discount_cumsum, save_params
 from decision_transformer.pmap import bcast_local_devices, synchronize_hosts, is_replicated
@@ -203,7 +203,7 @@ def train(args):
         data=jnp.concatenate(replay_buffer_data, axis=0).reshape(local_devices_to_use, -1, max_epi_len + context_len, trans_dim)
     ) # (local_devices_to_use, num_epi, max_epi_len + context_len, trans_dim)
 
-    policy_model = make_transformer_networks(
+    dynamics_model = make_transformer_networks(
         state_dim=state_dim,
         act_dim=act_dim,
         controlled_variables_dim=controlled_variables_dim,
@@ -222,22 +222,22 @@ def train(args):
         transition_steps=warmup_steps,
         transition_begin=0
     )
-    policy_optimizer = optax.chain(
+    dynamics_optimizer = optax.chain(
         optax.clip(args.gradient_clipping),
         optax.adamw(learning_rate=schedule_fn, weight_decay=wt_decay),
     )
     key_params, key_dropout = jax.random.split(global_key)
-    policy_params = policy_model.init({'params': key_params, 'dropout': key_dropout})
-    policy_optimizer_state = policy_optimizer.init(policy_params)
+    dynamics_params_prebroadcast = dynamics_model.init({'params': key_params, 'dropout': key_dropout})
+    dynamics_optimizer_state = dynamics_optimizer.init(dynamics_params_prebroadcast)
 
     # count the number of parameters
-    param_count = sum(x.size for x in jax.tree_util.tree_leaves(policy_params))
-    print(f'num_policy_param: {param_count}')
+    param_count = sum(x.size for x in jax.tree_util.tree_leaves(dynamics_params_prebroadcast))
+    print(f'num_dynamics_param: {param_count}')
 
-    policy_optimizer_state, policy_params = bcast_local_devices(
-        (policy_optimizer_state, policy_params), local_devices_to_use)
+    dynamics_optimizer_state, dynamics_params = bcast_local_devices(
+        (dynamics_optimizer_state, dynamics_params_prebroadcast), local_devices_to_use)
 
-    def transformer_loss(policy_params: Any,
+    def transformer_loss(dynamics_params: Any,
                    transitions: Transition, key: jnp.ndarray) -> jnp.ndarray:
         ts = transitions.ts.reshape(transitions.ts.shape[:2]).astype(jnp.int32)  # (batch_size_per_device, context_len)
         s_t = transitions.s_t  # (batch_size_per_device, context_len, state_dim)
@@ -246,7 +246,8 @@ def train(args):
         rtg_t = transitions.rtg_t  # (batch_size_per_device, context_len, 1)
         mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
 
-        y_p = policy_model.apply(policy_params, ts, s_t, y_t, a_t, y_t, rtg_t, rngs={'dropout': key})
+
+        y_p = dynamics_model.apply(dynamics_params, ts, s_t, y_t, a_t, y_t, rtg_t, mask, rngs={'dropout': key})
 
         def true_fn(y_mean, y_log_std, y_t):
             dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
@@ -295,19 +296,19 @@ def train(args):
 
         key, key_actor = jax.random.split(state.key, 2)
 
-        transformer_loss, transformer_grads = transformer_grad(state.policy_params, transitions, key_actor)
+        transformer_loss, transformer_grads = transformer_grad(state.params, transitions, key_actor)
         transformer_grads = jax.lax.pmean(transformer_grads, axis_name='i')
-        policy_params_update, policy_optimizer_state = policy_optimizer.update(
-            transformer_grads, state.policy_optimizer_state, state.policy_params)
-        policy_params = optax.apply_updates(state.policy_params, policy_params_update)
+        dynamics_params_update, dynamics_optimizer_state = dynamics_optimizer.update(
+            transformer_grads, state.optimizer_state, state.params)
+        dynamics_params = optax.apply_updates(state.params, dynamics_params_update)
 
         metrics = {'transformer_loss': transformer_loss}
 
         new_state = TrainingState(
-            policy_optimizer_state=policy_optimizer_state,
-            policy_params=policy_params,
+            optimizer_state=dynamics_optimizer_state,
+            params=dynamics_params,
             key=key,
-            actor_steps=state.actor_steps + 1)
+            steps=state.steps + 1)
         return new_state, metrics
 
     def sample_data(training_state, replay_buffer, max_epi_len):
@@ -357,10 +358,10 @@ def train(args):
     run_training = jax.pmap(partial(run_training, max_epi_len=max_epi_len), axis_name='i')
 
     training_state = TrainingState(
-        policy_optimizer_state=policy_optimizer_state,
-        policy_params=policy_params,
+        optimizer_state=dynamics_optimizer_state,
+        params=dynamics_params,
         key=jnp.stack(jax.random.split(local_key, local_devices_to_use)),
-        actor_steps=jnp.zeros((local_devices_to_use,)))
+        steps=jnp.zeros((local_devices_to_use,)))
 
     max_d4rl_score = -1.0
     total_updates = 0
@@ -407,12 +408,12 @@ def train(args):
         csv_writer.writerow(log_data)
 
         # save model
-        _policy_params = jax.tree_util.tree_map(lambda x: x[0], training_state.policy_params)
+        _dynamics_params = jax.tree_util.tree_map(lambda x: x[0], training_state.params)
 
-        if i_train_iter % args.policy_save_iters == 0 or i_train_iter == max_train_iters - 1:
+        if i_train_iter % args.dynamics_save_iters == 0 or i_train_iter == max_train_iters - 1:
             save_current_model_path = save_model_path[:-3] + f"_{total_updates}.pt"
             print("saving current model at: " + save_current_model_path)
-            save_params(save_current_model_path, _policy_params)
+            save_params(save_current_model_path, _dynamics_params)
 
     synchronize_hosts()
 
@@ -429,6 +430,53 @@ def train(args):
     print("saved max d4rl score model at: " + save_best_model_path)
     print("saved last updated model at: " + save_model_path)
     print("=" * 60)
+
+    VAE_model = VAE(
+        state_dim=state_dim,
+        act_dim=act_dim,
+        controlled_variables_dim=controlled_variables_dim,
+        n_blocks=n_blocks,
+        h_dim=embed_dim,
+        context_len=context_len,
+        n_heads=n_heads,
+        drop_p=dropout_p
+    )
+
+    batch_size = 1
+    dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
+    dummy_states = jnp.zeros((batch_size, context_len, state_dim))
+    dummy_latent = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+    dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
+    dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+    dummy_rtg = jnp.zeros((batch_size, context_len, 1))
+    dummy_mask = jnp.zeros((batch_size, context_len, 1))
+
+    key_params, key_dropout = jax.random.split(global_key)
+    VAE_params = VAE_model.init({'params': key_params, 'dropout': key_dropout},
+                                ts=dummy_timesteps,
+                                s_t=dummy_states,
+                                z_t=dummy_latent,
+                                a_t=dummy_actions,
+                                y_t=dummy_controlled_variables,
+                                rtg_t=dummy_rtg,
+                                mask=dummy_mask,
+                                dynamics_apply=dynamics_model.apply,
+                                dynamics_params=dynamics_params_prebroadcast,
+                                key=key_params)
+
+    xx=VAE_model.apply(VAE_params,
+                    ts=dummy_timesteps,
+                    s_t=dummy_states,
+                    z_t=dummy_latent,
+                    a_t=dummy_actions,
+                    y_t=dummy_controlled_variables,
+                    rtg_t=dummy_rtg,
+                    mask=dummy_mask,
+                    dynamics_apply=dynamics_model.apply,
+                    dynamics_params=dynamics_params_prebroadcast,
+                    key=key_params,
+                    rngs={'dropout': key_dropout})
+    breakpoint()
 
 
 if __name__ == "__main__":
@@ -457,9 +505,9 @@ if __name__ == "__main__":
     parser.add_argument('--wt_decay', type=float, default=1e-4)
     parser.add_argument('--warmup_steps', type=int, default=10000)
 
-    parser.add_argument('--max_train_iters', type=int, default=1_000)
+    parser.add_argument('--max_train_iters', type=int, default=2)
     parser.add_argument('--num_updates_per_iter', type=int, default=100)
-    parser.add_argument('--policy_save_iters', type=int, default=10)
+    parser.add_argument('--dynamics_save_iters', type=int, default=10)
     parser.add_argument('--rm_normalization', action='store_true', help='Turn off input normalization')
 
     parser.add_argument('--max_devices_per_host', type=int, default=None)
