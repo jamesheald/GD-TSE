@@ -143,6 +143,7 @@ class Transformer(linen.Module):
     kernel_init: Callable[..., Any] = lecun_normal()
     bias_init: Callable[..., Any] = zeros
     transformer_type: str = 'dynamics' # 'encoder', 'precoder' or 'dynamics'
+    trajectory_version: bool = False
 
     def setup(self):
         None
@@ -155,62 +156,79 @@ class Transformer(linen.Module):
                  actions: jnp.ndarray,
                  next_controlled_variables: jnp.ndarray,
                  returns_to_go: jnp.ndarray,
-                 mask: jnp.ndarray) -> jnp.ndarray:
+                 horizon: jnp.ndarray) -> jnp.ndarray:
         B, T, _ = states.shape
 
-        horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
         horizon_embeddings = linen.Embed(
             num_embeddings=self.context_len,
             features=self.h_dim)(horizon)
+        
+        if self.transformer_type == 'encoder':
+            num_positional_embeddings = next_controlled_variables.shape[1] + 1 # +1 for initial state
+        elif self.transformer_type == 'precoder' or self.transformer_type == 'dynamics':
+            num_positional_embeddings = self.context_len + 1 # +1 for initial state
 
-        positions = jnp.arange(self.context_len+1)[None,:].repeat(states.shape[0], axis=0)
+        positions = jnp.arange(num_positional_embeddings)[None,:].repeat(states.shape[0], axis=0)
         positional_embeddings = linen.Embed(
-            num_embeddings=self.context_len+1,
+            num_embeddings=num_positional_embeddings,
             features=self.h_dim)(positions)
 
         initial_state_embedding = linen.Dense(
             self.h_dim,
             dtype=self.dtype,
             kernel_init=self.kernel_init,
-            bias_init=self.bias_init)(states[:,0,:]) + positional_embeddings[:,0,:]
+            bias_init=self.bias_init)(states[:,0,:]) 
+        initial_state_embedding += positional_embeddings[:,0,:]
 
         if self.transformer_type == 'encoder': # infer latent variable z_0 given s_0, y_1, ..., y_H
 
-            initial_state_embedding += horizon_embeddings
+            initial_state_embedding += horizon_embeddings.squeeze()
             
             controlled_variables_embeddings = linen.Dense(
                 self.h_dim,
                 dtype=self.dtype,
                 kernel_init=self.kernel_init,
-                bias_init=self.bias_init)(next_controlled_variables) + positional_embeddings[:,1:,:] + horizon_embeddings
+                bias_init=self.bias_init)(next_controlled_variables) 
+            controlled_variables_embeddings += positional_embeddings[:,1:,:] 
+            controlled_variables_embeddings += horizon_embeddings
             
             # concatenate initial state and controlled variables
             # (s_0, y_1, ..., y_H)
             # (B x [T + 1] x h_dim)
             h = jnp.concatenate((initial_state_embedding[:,None,:], controlled_variables_embeddings), axis=1)
+
+            max_T = next_controlled_variables.shape[1]+1
         
         elif self.transformer_type == 'precoder': # generate action variable a_t given s_0, z_0, a_0, ..., a_t-1
             
-            initial_state_embedding += horizon_embeddings
+            initial_state_embedding += horizon_embeddings.squeeze()
             
             latent_embedding = linen.Dense(
                 self.h_dim,
                 dtype=self.dtype,
                 kernel_init=self.kernel_init,
-                bias_init=self.bias_init)(latent) + positional_embeddings[:,1,:] + horizon_embeddings
+                bias_init=self.bias_init)(latent) 
+            latent_embedding += positional_embeddings[:,1,:]
+            latent_embedding += horizon_embeddings.squeeze()
             
             action_embeddings = linen.Dense(
                 self.h_dim,
                 dtype=self.dtype,
                 kernel_init=self.kernel_init,
-                bias_init=self.bias_init)(actions[:,:-1,:]) + positional_embeddings[:,2:,:] + horizon_embeddings
+                bias_init=self.bias_init)(actions[:,:-1,:])
+            action_embeddings += positional_embeddings[:,2:,:] 
+            action_embeddings += horizon_embeddings
             
             # concatenate initial state, latent and actions
             # (s_0, z_0, a_1, ..., a_t)
             # (B x [T + 1] x h_dim)
             h = jnp.concatenate((initial_state_embedding[:,None,:], latent_embedding[:,None,:], action_embeddings), axis=1)
 
+            max_T = self.context_len + 1
+
         elif self.transformer_type == 'dynamics': # predict next controlled variables given s_0, a_0, ..., a_t
+
+            # initial_state_embedding += horizon_embeddings # dynamics don't depend on horizon
            
             action_embeddings = linen.Dense(
                 self.h_dim,
@@ -223,15 +241,22 @@ class Transformer(linen.Module):
             # (B x [T + 1] x h_dim)
             h = jnp.concatenate((initial_state_embedding[:,None,:], action_embeddings), axis=1)
 
+            max_T = self.context_len + 1
+
         h = linen.LayerNorm(dtype=self.dtype)(h)
 
+        # first_elem = mask[:, :1, :]
+        # padded_mask = jnp.concatenate([first_elem, mask], axis=1)
+        if next_controlled_variables.shape[1] == 1: # in this setting, padded_mask plays no role (multplication factor of 1)
+            padded_mask = jnp.ones((B, 2, 1), dtype=jnp.float32)
+        else:
+            arange = jnp.arange(next_controlled_variables.shape[1] + 1)[None, :]  # Shape: (1, T)
+            padded_mask = (arange <= horizon).astype(jnp.float32)[..., None]  # Shape: (B, T, 1)
         # transformer and prediction
-        first_elem = mask[:, :1, :]
-        padded_mask = jnp.concatenate([first_elem, mask], axis=1)
         for _ in range(self.n_blocks):
             h = Block(
                 h_dim=self.h_dim,
-                max_T=self.context_len+1,
+                max_T=max_T,
                 n_heads=self.n_heads,
                 drop_p=self.drop_p,
                 use_causal_mask=False if self.transformer_type == 'encoder' else True)(h, padded_mask)
@@ -250,12 +275,12 @@ class Transformer(linen.Module):
             # Avoid divide-by-zero
             h = sum_h / jnp.maximum(count, 1)
 
-            output_dim = self.controlled_variables_dim * 2 # * self.context_len
+            output_dim = next_controlled_variables.shape[1] * self.controlled_variables_dim * 2
         elif self.transformer_type == 'precoder':
             h = h[:, 1:]
             output_dim = self.act_dim
         elif self.transformer_type == 'dynamics':
-            h = h[:, 1:]
+            h = h[:, -next_controlled_variables.shape[1]:]
             output_dim = self.controlled_variables_dim * 2
             
         # get outputs
@@ -318,7 +343,7 @@ def make_transformer_networks(state_dim: int,
     dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
     dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
     dummy_rtg = jnp.zeros((batch_size, context_len, 1))
-    dummy_mask = jnp.zeros((batch_size, context_len, 1))
+    dummy_horizon = jnp.zeros((batch_size, 1), dtype=jnp.int32)
 
     def policy_model_fn():
         class PolicyModule(linen.Module):
@@ -330,7 +355,7 @@ def make_transformer_networks(state_dim: int,
                          actions: jnp.ndarray,
                          next_controlled_variables: jnp.ndarray,
                          returns_to_go: jnp.ndarray,
-                         mask: jnp.ndarray):
+                         horizon: jnp.ndarray):
                 outputs = make_transformer(
                     state_dim=state_dim,
                     act_dim=act_dim,
@@ -340,13 +365,13 @@ def make_transformer_networks(state_dim: int,
                     context_len=context_len,
                     n_heads=n_heads,
                     drop_p=drop_p,
-                    transformer_type=transformer_type)(timesteps, states, latent, actions, next_controlled_variables, returns_to_go, mask)
+                    transformer_type=transformer_type)(timesteps, states, latent, actions, next_controlled_variables, returns_to_go, horizon)
                 return outputs
 
         policy_module = PolicyModule()
         policy = FeedForwardModel(
             init=lambda key: policy_module.init(
-                key, dummy_timesteps, dummy_states, dummy_latent, dummy_actions,dummy_controlled_variables, dummy_rtg, dummy_mask),
+                key, dummy_timesteps, dummy_states, dummy_latent, dummy_actions,dummy_controlled_variables, dummy_rtg, dummy_horizon),
             apply=policy_module.apply)
         return policy
     return policy_model_fn()
@@ -383,12 +408,12 @@ class VAE(linen.Module):
                                     drop_p=self.drop_p,
                                     transformer_type='precoder')
 
-    def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, mask, dynamics_apply, dynamics_params, key):
+    def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_apply, dynamics_params, key):
 
         dropout_key, sample_key = jax.random.split(key)
         
         ###################### encode ###################### 
-        z_dist_params = self.encoder(ts, s_t, z_t, a_t, y_t, rtg_t, mask)
+        z_dist_params = self.encoder(ts, s_t, z_t, a_t, y_t, rtg_t, horizon)
 
         z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
         min_log_std = -20.
@@ -402,12 +427,12 @@ class VAE(linen.Module):
 
         for t in range(self.context_len):
 
-            outputs = self.precoder(ts, s_t, z_t, actions, y_t, rtg_t, mask)
+            outputs = self.precoder(ts, s_t, z_t, actions, y_t, rtg_t, horizon)
 
             actions = actions.at[:,t,:].set(outputs[:,t,:])
 
         ###################### dynamics ###################### 
-        y_p = dynamics_apply(dynamics_params, ts, s_t, y_t, actions, y_t, rtg_t, mask, rngs={'dropout': dropout_key})
+        y_p = dynamics_apply(dynamics_params, ts, s_t, y_t, actions, y_t, rtg_t, horizon, rngs={'dropout': dropout_key})
 
         def true_fn(y_mean, y_log_std, y_t):
             dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
@@ -427,28 +452,32 @@ class VAE(linen.Module):
         y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
         y_mean = y_mean.reshape(-1, self.controlled_variables_dim)
         y_log_std = y_log_std.reshape(-1, self.controlled_variables_dim)
-        y_t = y_t.reshape(-1, self.controlled_variables_dim)
 
         ###################### loss ###################### 
         
-        log_probs = batch_get_log_prob((mask.reshape(-1, 1) > 0).squeeze(-1), y_mean, y_log_std, y_t)
+        if y_t.shape[1] == 1: # in this setting, padded_mask plays no role (multplication factor of 1)
+            y_t = y_t.reshape(-1, self.controlled_variables_dim)
+            log_probs = jax.vmap(true_fn)(y_mean, y_log_std, y_t)
+        else:
+            y_t = y_t.reshape(-1, self.controlled_variables_dim)
+            log_probs = batch_get_log_prob((mask.reshape(-1, 1) > 0).squeeze(-1), y_mean, y_log_std, y_t)
 
         decoder_loss = -log_probs
         
         def KL_diagonal_Gaussians(mu_1, log_var_1, mu_0, log_var_0):
             """
-            KL(q||p), where q is posterior and p is prior
+            KL(q||p), where q is posterior and p is priorl
             mu_1, log_var_1 is the mean and log variances of the posterior
             mu_0, log_var_0 is the mean and log variances of the prior
             """
 
-            return (0.5 * (log_var_0 - log_var_1 + jnp.exp(log_var_1 - log_var_0) 
-                           - 1.0 + (mu_1 - mu_0)**2 / jnp.exp(log_var_0)))
+            return jnp.sum(0.5 * (log_var_0 - log_var_1 + jnp.exp(log_var_1 - log_var_0) 
+                           - 1.0 + (mu_1 - mu_0)**2 / jnp.exp(log_var_0)), axis=-1)
 
         kl_loss = KL_diagonal_Gaussians(z_mean, z_log_std**2, jnp.zeros(z_mean.shape), jnp.ones(z_log_std.shape))
 
         breakpoint()
         
-        vae_loss = decoder_loss + kl_loss
+        vae_loss = decoder_loss.mean() + kl_loss.mean()
 
-        return vae_loss.mean()
+        return vae_loss

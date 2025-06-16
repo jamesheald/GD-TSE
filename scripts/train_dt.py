@@ -242,12 +242,21 @@ def train(args):
         ts = transitions.ts.reshape(transitions.ts.shape[:2]).astype(jnp.int32)  # (batch_size_per_device, context_len)
         s_t = transitions.s_t  # (batch_size_per_device, context_len, state_dim)
         a_t = transitions.a_t  # (batch_size_per_device, context_len, action_dim)
-        y_t = transitions.y_t  # (batch_size_per_device, context_len, controlled_variables_dim)
         rtg_t = transitions.rtg_t  # (batch_size_per_device, context_len, 1)
         mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
+        
+        horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
+        if args.trajectory_version:
+            y_t = transitions.y_t  # (batch_size_per_device, context_len, controlled_variables_dim)
+            dummy_z_t = jnp.zeros((batch_size, context_len * controlled_variables_dim))
+        else:
+            def slice_fn(y_t_b, start_t):
+                return jax.lax.dynamic_slice(y_t_b, (start_t, 0), (1, controlled_variables_dim))  # (1, D)
+            start_ts = (horizon - 1).squeeze(-1)  # shape: (B,)
+            y_t = jax.vmap(slice_fn)(transitions.y_t, start_ts)  # (B, 1, D) y_t = transitions.y_t[:,horizon-1:horizon,:]
+            dummy_z_t = jnp.zeros((batch_size, controlled_variables_dim))
 
-
-        y_p = dynamics_model.apply(dynamics_params, ts, s_t, y_t, a_t, y_t, rtg_t, mask, rngs={'dropout': key})
+        y_p = dynamics_model.apply(dynamics_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, rngs={'dropout': key})
 
         def true_fn(y_mean, y_log_std, y_t):
             dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
@@ -269,7 +278,10 @@ def train(args):
         y_log_std = y_log_std.reshape(-1, controlled_variables_dim)
         y_t = y_t.reshape(-1, controlled_variables_dim)
         
-        log_probs = batch_get_log_prob((mask.reshape(-1, 1) > 0).squeeze(-1), y_mean, y_log_std, y_t)
+        if args.trajectory_version:
+            log_probs = batch_get_log_prob((mask.reshape(-1, 1) > 0).squeeze(-1), y_mean, y_log_std, y_t)
+        else:
+            log_probs = jax.vmap(true_fn)(y_mean, y_log_std, y_t)
 
         transformer_loss = jnp.mean(-log_probs)
 
@@ -447,8 +459,10 @@ def train(args):
     dummy_states = jnp.zeros((batch_size, context_len, state_dim))
     dummy_latent = jnp.zeros((batch_size, context_len, controlled_variables_dim))
     dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
-    dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+    # dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+    dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
     dummy_rtg = jnp.zeros((batch_size, context_len, 1))
+    dummy_horizon= jnp.zeros((batch_size, 1), dtype=jnp.int32)
     dummy_mask = jnp.zeros((batch_size, context_len, 1))
 
     key_params, key_dropout = jax.random.split(global_key)
@@ -459,6 +473,7 @@ def train(args):
                                 a_t=dummy_actions,
                                 y_t=dummy_controlled_variables,
                                 rtg_t=dummy_rtg,
+                                horizon=dummy_horizon,
                                 mask=dummy_mask,
                                 dynamics_apply=dynamics_model.apply,
                                 dynamics_params=dynamics_params_prebroadcast,
@@ -471,6 +486,7 @@ def train(args):
                     a_t=dummy_actions,
                     y_t=dummy_controlled_variables,
                     rtg_t=dummy_rtg,
+                    horizon=dummy_horizon,
                     mask=dummy_mask,
                     dynamics_apply=dynamics_model.apply,
                     dynamics_params=dynamics_params_prebroadcast,
@@ -511,6 +527,8 @@ if __name__ == "__main__":
     parser.add_argument('--rm_normalization', action='store_true', help='Turn off input normalization')
 
     parser.add_argument('--max_devices_per_host', type=int, default=None)
+
+    parser.add_argument('--trajectory_version', type=bool, default=False)
 
     args = parser.parse_args()
 
