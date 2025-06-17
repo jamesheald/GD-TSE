@@ -161,16 +161,16 @@ class Transformer(linen.Module):
 
         horizon_embeddings = linen.Embed(
             num_embeddings=self.context_len,
-            features=self.h_dim)(horizon)
+            features=self.h_dim)(horizon-1)
         
         if self.transformer_type == 'encoder':
-            num_positional_embeddings = next_controlled_variables.shape[1] + 1 # +1 for initial state
+            max_T = next_controlled_variables.shape[1] + 1 # + 1 for initial state
         elif self.transformer_type == 'precoder' or self.transformer_type == 'dynamics':
-            num_positional_embeddings = self.context_len + 1 # +1 for initial state
+            max_T = self.context_len + 1 # + 1 for initial state
 
-        positions = jnp.arange(num_positional_embeddings)[None,:].repeat(states.shape[0], axis=0)
+        positions = jnp.arange(max_T)[None,:].repeat(states.shape[0], axis=0)
         positional_embeddings = linen.Embed(
-            num_embeddings=num_positional_embeddings,
+            num_embeddings=max_T,
             features=self.h_dim)(positions)
 
         initial_state_embedding = linen.Dense(
@@ -182,6 +182,9 @@ class Transformer(linen.Module):
 
         if self.transformer_type == 'encoder': # infer latent variable z_0 given s_0, y_1, ..., y_H
 
+            # condiiton the encoder on the horizon length
+            # currently conditioning by adding horizon embeddings
+            # an alternative is to add a seperate horizon embedding token and allow other variables to attend to it
             initial_state_embedding += horizon_embeddings.squeeze()
             
             controlled_variables_embeddings = linen.Dense(
@@ -196,8 +199,6 @@ class Transformer(linen.Module):
             # (s_0, y_1, ..., y_H)
             # (B x [T + 1] x h_dim)
             h = jnp.concatenate((initial_state_embedding[:,None,:], controlled_variables_embeddings), axis=1)
-
-            max_T = next_controlled_variables.shape[1]+1
         
         elif self.transformer_type == 'precoder': # generate action variable a_t given s_0, z_0, a_0, ..., a_t-1
             
@@ -224,8 +225,6 @@ class Transformer(linen.Module):
             # (B x [T + 1] x h_dim)
             h = jnp.concatenate((initial_state_embedding[:,None,:], latent_embedding[:,None,:], action_embeddings), axis=1)
 
-            max_T = self.context_len + 1
-
         elif self.transformer_type == 'dynamics': # predict next controlled variables given s_0, a_0, ..., a_t
 
             # initial_state_embedding += horizon_embeddings # dynamics don't depend on horizon
@@ -241,17 +240,16 @@ class Transformer(linen.Module):
             # (B x [T + 1] x h_dim)
             h = jnp.concatenate((initial_state_embedding[:,None,:], action_embeddings), axis=1)
 
-            max_T = self.context_len + 1
-
         h = linen.LayerNorm(dtype=self.dtype)(h)
 
         # first_elem = mask[:, :1, :]
         # padded_mask = jnp.concatenate([first_elem, mask], axis=1)
-        if next_controlled_variables.shape[1] == 1: # in this setting, padded_mask plays no role (multplication factor of 1)
+        if next_controlled_variables.shape[1] == 1: # in this setting, padded_mask plays no role (multiply by 1)
             padded_mask = jnp.ones((B, 2, 1), dtype=jnp.float32)
         else:
             arange = jnp.arange(next_controlled_variables.shape[1] + 1)[None, :]  # Shape: (1, T)
             padded_mask = (arange <= horizon).astype(jnp.float32)[..., None]  # Shape: (B, T, 1)
+        
         # transformer and prediction
         for _ in range(self.n_blocks):
             h = Block(
@@ -271,9 +269,8 @@ class Transformer(linen.Module):
             # Count of masked positions per batch
             count = jnp.sum(padded_mask, axis=1)  # shape (B, 1)
 
-            # Pool token embeddings
-            # Avoid divide-by-zero
-            h = sum_h / jnp.maximum(count, 1)
+            # Pool (mean) token embeddings
+            h = sum_h / count
 
             output_dim = next_controlled_variables.shape[1] * self.controlled_variables_dim * 2
         elif self.transformer_type == 'precoder':
@@ -335,13 +332,18 @@ def make_transformer_networks(state_dim: int,
                               context_len: int,
                               n_heads: int,
                               drop_p: float,
+                              trajectory_version: bool,
                               transformer_type: str) -> FeedForwardModel:
     batch_size = 1
     dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
     dummy_states = jnp.zeros((batch_size, context_len, state_dim))
-    dummy_latent = jnp.zeros((batch_size, context_len, controlled_variables_dim))
     dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
-    dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+    if trajectory_version:
+        dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
+        dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+    else:
+        dummy_latent = jnp.zeros((batch_size, controlled_variables_dim))
+        dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
     dummy_rtg = jnp.zeros((batch_size, context_len, 1))
     dummy_horizon = jnp.zeros((batch_size, 1), dtype=jnp.int32)
 
@@ -423,16 +425,16 @@ class VAE(linen.Module):
         z_t = dist.sample(seed=sample_key)
 
         ###################### precode ###################### 
+
+        # actions = a_t.copy()
+
         actions = jnp.zeros(a_t.shape)
-
         for t in range(self.context_len):
-
             outputs = self.precoder(ts, s_t, z_t, actions, y_t, rtg_t, horizon)
-
             actions = actions.at[:,t,:].set(outputs[:,t,:])
 
         ###################### dynamics ###################### 
-        y_p = dynamics_apply(dynamics_params, ts, s_t, y_t, actions, y_t, rtg_t, horizon, rngs={'dropout': dropout_key})
+        y_p = dynamics_apply(dynamics_params, ts, s_t, z_t, actions, y_t, rtg_t, horizon, rngs={'dropout': dropout_key})
 
         def true_fn(y_mean, y_log_std, y_t):
             dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
@@ -455,29 +457,31 @@ class VAE(linen.Module):
 
         ###################### loss ###################### 
         
-        if y_t.shape[1] == 1: # in this setting, padded_mask plays no role (multplication factor of 1)
+        if y_t.shape[1] == 1:
             y_t = y_t.reshape(-1, self.controlled_variables_dim)
             log_probs = jax.vmap(true_fn)(y_mean, y_log_std, y_t)
+            decoder_loss = -log_probs.mean()
         else:
             y_t = y_t.reshape(-1, self.controlled_variables_dim)
-            log_probs = batch_get_log_prob((mask.reshape(-1, 1) > 0).squeeze(-1), y_mean, y_log_std, y_t)
-
-        decoder_loss = -log_probs
+            valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
+            log_probs = batch_get_log_prob(valid_mask, y_mean, y_log_std, y_t)
+            decoder_loss = jnp.sum(-log_probs * valid_mask) / jnp.sum(valid_mask)
         
         def KL_diagonal_Gaussians(mu_1, log_var_1, mu_0, log_var_0):
             """
-            KL(q||p), where q is posterior and p is priorl
+            KL(q||p), where q is posterior and p is prior
             mu_1, log_var_1 is the mean and log variances of the posterior
             mu_0, log_var_0 is the mean and log variances of the prior
             """
 
             return jnp.sum(0.5 * (log_var_0 - log_var_1 + jnp.exp(log_var_1 - log_var_0) 
                            - 1.0 + (mu_1 - mu_0)**2 / jnp.exp(log_var_0)), axis=-1)
-
-        kl_loss = KL_diagonal_Gaussians(z_mean, z_log_std**2, jnp.zeros(z_mean.shape), jnp.ones(z_log_std.shape))
-
-        breakpoint()
         
-        vae_loss = decoder_loss.mean() + kl_loss.mean()
+        dist_z_post = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
+        dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_mean.shape), scale_diag=jnp.ones(z_log_std.shape))
 
-        return vae_loss
+        # independent standard normal prior
+        kl_loss = tfd.kl_divergence(dist_z_post, dist_z_prior).mean()
+        # kl_loss = KL_diagonal_Gaussians(z_mean, 2*z_log_std, jnp.zeros(z_mean.shape), jnp.zeros(z_log_std.shape)).mean()
+
+        return decoder_loss, kl_loss
