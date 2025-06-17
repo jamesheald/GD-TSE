@@ -120,10 +120,6 @@ def train(args):
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
 
-    save_model_name = "model.pt"
-    save_model_path = os.path.join(log_dir, save_model_name)
-    save_best_model_path = save_model_path[:-3] + "_best.pt"
-
     log_csv_name = "log.csv"
     log_csv_path = os.path.join(log_dir, log_csv_name)
 
@@ -209,6 +205,8 @@ def train(args):
     replay_buffer = ReplayBuffer(
         data=jnp.concatenate(replay_buffer_data, axis=0).reshape(local_devices_to_use, -1, max_epi_len + context_len, trans_dim)
     ) # (local_devices_to_use, num_epi, max_epi_len + context_len, trans_dim)
+
+    ###################################### dynamics training ###################################### 
 
     dynamics_model = make_transformer_networks(
         state_dim=state_dim,
@@ -384,7 +382,6 @@ def train(args):
         key=jnp.stack(jax.random.split(local_key, local_devices_to_use)),
         steps=jnp.zeros((local_devices_to_use,)))
 
-    max_d4rl_score = -1.0
     total_updates = 0
 
     wandb.init(
@@ -393,6 +390,8 @@ def train(args):
             project='jax_dt',
             config=args
         )
+    
+    save_model_path = os.path.join(log_dir, "dynamics_model.pt")
 
     for i_train_iter in range(max_train_iters):
         log_dynamics_losses = []
@@ -439,20 +438,18 @@ def train(args):
     synchronize_hosts()
     
     print("=" * 60)
-    print("finished training!")
+    print("finished training dynamics!")
     print("=" * 60)
     end_time = datetime.now().replace(microsecond=0)
     time_elapsed = str(end_time - start_time)
     end_time_str = end_time.strftime("%y-%m-%d-%H-%M-%S")
-    print("started training at: " + start_time_str)
-    print("finished training at: " + end_time_str)
-    print("total training time: " + time_elapsed)
-    print("max d4rl score: " + format(max_d4rl_score, ".5f"))
-    print("saved max d4rl score model at: " + save_best_model_path)
+    print("started training dynamics at: " + start_time_str)
+    print("finished training dynamics at: " + end_time_str)
+    print("total dynamics training time: " + time_elapsed)
     print("saved last updated model at: " + save_model_path)
     print("=" * 60)
 
-    ################################################################################################
+    ###################################### vae training ###################################### 
 
     vae_model = VAE(
         state_dim=state_dim,
@@ -507,6 +504,9 @@ def train(args):
     
     vae_optimizer_state = vae_optimizer.init(vae_params)
 
+    vae_optimizer_state, vae_params = bcast_local_devices(
+        (vae_optimizer_state, vae_params), local_devices_to_use)
+
     # count the number of parameters
     param_count = sum(x.size for x in jax.tree_util.tree_leaves(vae_params))
     print(f'num_vae_param: {param_count}')
@@ -558,7 +558,7 @@ def train(args):
         key, key_vae = jax.random.split(state.key, 2)
 
         (loss, (decoder_loss, kl_loss)), vae_grads = vae_grad(state.params, transitions, key_vae)
-        # vae_grads = jax.lax.pmean(vae_grads, axis_name='i')
+        vae_grads = jax.lax.pmean(vae_grads, axis_name='i')
         vae_params_update, vae_optimizer_state = vae_optimizer.update(
             vae_grads, state.optimizer_state, state.params)
         vae_params = optax.apply_updates(state.params, vae_params_update)
@@ -583,25 +583,25 @@ def train(args):
         return (training_state, replay_buffer), metrics
 
     def run_training_vae(training_state, replay_buffer, max_epi_len):
-        training_state.replace(key=jax.random.PRNGKey(0))
+        synchro = is_replicated(
+            training_state.replace(key=jax.random.PRNGKey(0)), axis_name='i')
         (training_state, replay_buffer), metrics = jax.lax.scan(
             partial(run_one_epoch_vae, max_epi_len=max_epi_len), (training_state, replay_buffer), (),
             length=num_updates_per_iter)
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
-        return training_state, replay_buffer, metrics
+        return training_state, replay_buffer, metrics, synchro
     
-    # run_training = jax.pmap(partial(run_training, max_epi_len=max_epi_len), axis_name='i')
-    run_training_vae = partial(run_training_vae, max_epi_len=max_epi_len)
+    run_training_vae = jax.pmap(partial(run_training_vae, max_epi_len=max_epi_len), axis_name='i')
+    # run_training_vae = partial(run_training_vae, max_epi_len=max_epi_len)
 
     vae_training_state = TrainingState(
         optimizer_state=vae_optimizer_state,
         params=vae_params,
-        # key=jnp.stack(jax.random.split(local_key, local_devices_to_use)),
-        key=local_key,
-        # steps=jnp.zeros((local_devices_to_use,)))
-        steps=jnp.zeros(1))
+        key=jnp.stack(jax.random.split(local_key, local_devices_to_use)),
+        # key=local_key,
+        steps=jnp.zeros((local_devices_to_use,)))
+        # steps=jnp.zeros(1))
 
-    max_d4rl_score = -1.0
     total_updates = 0
 
     # wandb.init(
@@ -611,9 +611,7 @@ def train(args):
     #         config=args
     #     )
 
-    replay_buffer = ReplayBuffer(
-        data=jnp.concatenate(replay_buffer_data, axis=0).reshape(-1, max_epi_len + context_len, trans_dim)
-    )
+    save_model_path = os.path.join(log_dir, "vae_model.pt")
 
     for i_train_iter in range(max_train_iters):
         log_vae_losses = []
@@ -621,8 +619,9 @@ def train(args):
         log_kl_losses = []
 
         # optimization
-        vae_training_state, replay_buffer, training_metrics = run_training_vae(
+        vae_training_state, replay_buffer, training_metrics, synchro = run_training_vae(
             vae_training_state, replay_buffer)
+        assert synchro[0], (current_step, vae_training_state)
         jax.tree_util.tree_map(lambda x: x.block_until_ready(), training_metrics)
         log_vae_losses.append(training_metrics['loss'])
         log_decoder_losses.append(training_metrics['decoder_loss'])
@@ -668,17 +667,17 @@ def train(args):
             print("saving current model at: " + save_current_model_path)
             save_params(save_current_model_path, _vae_params)
 
+    synchronize_hosts()
+    
     print("=" * 60)
-    print("finished training!")
+    print("finished training vae!")
     print("=" * 60)
     end_time = datetime.now().replace(microsecond=0)
     time_elapsed = str(end_time - start_time)
     end_time_str = end_time.strftime("%y-%m-%d-%H-%M-%S")
-    print("started training at: " + start_time_str)
-    print("finished training at: " + end_time_str)
-    print("total training time: " + time_elapsed)
-    print("max d4rl score: " + format(max_d4rl_score, ".5f"))
-    print("saved max d4rl score model at: " + save_best_model_path)
+    print("started training vae at: " + start_time_str)
+    print("finished training vae at: " + end_time_str)
+    print("total vae training time: " + time_elapsed)
     print("saved last updated model at: " + save_model_path)
     print("=" * 60)
 
@@ -697,7 +696,6 @@ def train(args):
     #                 rngs={'dropout': key_dropout})
     breakpoint()
 
-
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
@@ -711,7 +709,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_dir', type=str, default='data/')
     parser.add_argument('--log_dir', type=str, default='dt_runs/')
 
-    parser.add_argument('--context_len', type=int, default=2)
+    parser.add_argument('--context_len', type=int, default=20)
     parser.add_argument('--n_blocks', type=int, default=3)
     parser.add_argument('--embed_dim', type=int, default=128)
     parser.add_argument('--n_heads', type=int, default=1)
@@ -724,10 +722,10 @@ if __name__ == "__main__":
     parser.add_argument('--wt_decay', type=float, default=1e-4)
     parser.add_argument('--warmup_steps', type=int, default=10000)
 
-    parser.add_argument('--max_train_iters', type=int, default=10)
+    parser.add_argument('--max_train_iters', type=int, default=1_000)
     parser.add_argument('--num_updates_per_iter', type=int, default=100)
-    parser.add_argument('--dynamics_save_iters', type=int, default=10)
-    parser.add_argument('--vae_save_iters', type=int, default=10)
+    parser.add_argument('--dynamics_save_iters', type=int, default=100)
+    parser.add_argument('--vae_save_iters', type=int, default=100)
     parser.add_argument('--rm_normalization', action='store_true', help='Turn off input normalization')
 
     parser.add_argument('--max_devices_per_host', type=int, default=None)

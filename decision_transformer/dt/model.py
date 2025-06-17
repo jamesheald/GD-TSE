@@ -347,8 +347,8 @@ def make_transformer_networks(state_dim: int,
     dummy_rtg = jnp.zeros((batch_size, context_len, 1))
     dummy_horizon = jnp.zeros((batch_size, 1), dtype=jnp.int32)
 
-    def policy_model_fn():
-        class PolicyModule(linen.Module):
+    def transformer_model_fn():
+        class TransformerModule(linen.Module):
             @linen.compact
             def __call__(self,
                          timesteps: jnp.ndarray,
@@ -370,13 +370,13 @@ def make_transformer_networks(state_dim: int,
                     transformer_type=transformer_type)(timesteps, states, latent, actions, next_controlled_variables, returns_to_go, horizon)
                 return outputs
 
-        policy_module = PolicyModule()
-        policy = FeedForwardModel(
-            init=lambda key: policy_module.init(
-                key, dummy_timesteps, dummy_states, dummy_latent, dummy_actions,dummy_controlled_variables, dummy_rtg, dummy_horizon),
-            apply=policy_module.apply)
-        return policy
-    return policy_model_fn()
+        transformer_module = TransformerModule()
+        transformer = FeedForwardModel(
+            init=lambda key: transformer_module.init(
+                key, dummy_timesteps, dummy_states, dummy_latent, dummy_actions, dummy_controlled_variables, dummy_rtg, dummy_horizon),
+            apply=transformer_module.apply)
+        return transformer
+    return transformer_model_fn()
 
 class VAE(linen.Module):
     state_dim: int
@@ -426,8 +426,6 @@ class VAE(linen.Module):
 
         ###################### precode ###################### 
 
-        # actions = a_t.copy()
-
         actions = jnp.zeros(a_t.shape)
         for t in range(self.context_len):
             outputs = self.precoder(ts, s_t, z_t, actions, y_t, rtg_t, horizon)
@@ -467,21 +465,10 @@ class VAE(linen.Module):
             log_probs = batch_get_log_prob(valid_mask, y_mean, y_log_std, y_t)
             decoder_loss = jnp.sum(-log_probs * valid_mask) / jnp.sum(valid_mask)
         
-        def KL_diagonal_Gaussians(mu_1, log_var_1, mu_0, log_var_0):
-            """
-            KL(q||p), where q is posterior and p is prior
-            mu_1, log_var_1 is the mean and log variances of the posterior
-            mu_0, log_var_0 is the mean and log variances of the prior
-            """
-
-            return jnp.sum(0.5 * (log_var_0 - log_var_1 + jnp.exp(log_var_1 - log_var_0) 
-                           - 1.0 + (mu_1 - mu_0)**2 / jnp.exp(log_var_0)), axis=-1)
-        
         dist_z_post = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
         dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_mean.shape), scale_diag=jnp.ones(z_log_std.shape))
 
         # independent standard normal prior
         kl_loss = tfd.kl_divergence(dist_z_post, dist_z_prior).mean()
-        # kl_loss = KL_diagonal_Gaussians(z_mean, 2*z_log_std, jnp.zeros(z_mean.shape), jnp.zeros(z_log_std.shape)).mean()
 
         return decoder_loss, kl_loss
