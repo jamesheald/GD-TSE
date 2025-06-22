@@ -474,7 +474,7 @@ class VAE(linen.Module):
         batch_get_log_prob = jax.vmap(get_log_prob)
         
         a_t = a_t.reshape(-1, self.act_dim)
-        a_t = jnp.clip(a_t, -1+1e-6, -1+1e-6)
+        a_t = jnp.clip(a_t, -1+1e-6, 1-1e-6)
         valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
         log_probs = batch_get_log_prob(valid_mask, a_mean, a_log_std, a_t)
         decoder_loss = jnp.sum(-log_probs * valid_mask) / jnp.sum(valid_mask)
@@ -482,6 +482,9 @@ class VAE(linen.Module):
         # independent standard normal prior
         dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_mean.shape), scale_diag=jnp.ones(z_log_std.shape))
         kl_loss = tfd.kl_divergence(dist_z_post, dist_z_prior).mean()
+
+        decoder_loss /= self.act_dim
+        kl_loss /= self.act_dim
 
         return decoder_loss, kl_loss
     
@@ -558,5 +561,7 @@ class empowerment(linen.Module):
         log_prob_z = post_dist.log_prob(z_samp)
 
         loss = -jnp.mean(log_prob_z)
+
+        loss /= z_samp.shape[-1]
         
         return loss

@@ -23,7 +23,7 @@ import wandb
 import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
 
-from decision_transformer.dt.model import make_transformer_networks, VAE, empowerment
+from decision_transformer.dt.model import make_transformer_networks, VAE, empowerment, Transformer
 from decision_transformer.dt.utils import ReplayBuffer, TrainingState, Transition
 from decision_transformer.dt.utils import discount_cumsum, save_params, load_params
 from decision_transformer.pmap import bcast_local_devices, synchronize_hosts, is_replicated
@@ -102,6 +102,7 @@ def train(args):
     embed_dim = args.embed_dim          # embedding (hidden) dim of transformer
     n_heads = args.n_heads              # num of transformer heads
     dropout_p = args.dropout_p          # dropout probability
+    dynamics_dropout_p = args.dynamics_dropout_p
 
     # load data from this file
     env_d4rl_name = 'relocate-expert-v1'
@@ -225,7 +226,7 @@ def train(args):
         h_dim=embed_dim,
         context_len=context_len,
         n_heads=n_heads,
-        drop_p=dropout_p,
+        drop_p=dynamics_dropout_p,
         trajectory_version=args.trajectory_version,
         transformer_type='dynamics'
     )
@@ -743,9 +744,8 @@ def train(args):
                                 dynamics_params=_dynamics_params,
                                 key=key_params)
 
-    total_updates = 1000
     load_model_path = os.path.join(log_dir, "vae_model.pt")
-    load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
+    load_current_model_path = load_model_path[:-3] + f"_{max_train_iters*args.vae_save_iters}.pt"
     _vae_params = load_params(load_current_model_path)
     # emp_params['params']['precoder'] = _vae_params['params']['precoder']
     # emp_params['params']['encoder'] = _vae_params['params']['encoder']
@@ -910,6 +910,83 @@ def train(args):
     print("saved last updated model at: " + save_model_path)
     print("=" * 60)
 
+    ###################################### evaluation ###################################### 
+
+    import minari
+    dataset = minari.load_dataset('D4RL/relocate/expert-v2')
+    env = dataset.recover_environment(render_mode='rgb_array')
+
+    batch_size = 1
+    dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
+    dummy_states = jnp.zeros((batch_size, context_len, state_dim))
+    dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
+    if args.trajectory_version:
+        dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
+        dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+    else:
+        dummy_latent = jnp.zeros((batch_size, controlled_variables_dim))
+        dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
+    dummy_rtg = jnp.zeros((batch_size, context_len, 1))
+    dummy_horizon= jnp.zeros((batch_size, 1), dtype=jnp.int32)
+    dummy_mask = jnp.zeros((batch_size, context_len, 1))
+
+    dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros((1,6)), scale_diag=jnp.ones((1,6)))
+
+    precoder = Transformer(state_dim=state_dim,
+                        act_dim=act_dim,
+                        controlled_variables_dim=controlled_variables_dim,
+                        n_blocks=n_blocks,
+                        h_dim=embed_dim,
+                        context_len=context_len,
+                        n_heads=n_heads,
+                        drop_p=dropout_p,
+                        transformer_type='action_decoder')
+    
+    def normalize_obs(obs):
+        norm_obs = (obs - state_mean) / state_std
+        return norm_obs
+
+    for model in ['vae', 'emp']:
+
+        if model == 'vae':
+            model_params = {'params': _vae_params['params']['decoder']}
+        elif model == 'emp':
+            model_params = {'params': _emp_params['params']['precoder']}
+        
+        actions = dummy_actions.copy()
+        env.reset()
+        # s_t = replay_buffer.data[0,:1,:1,:state_dim]
+        s_t = jnp.concatenate((env.unwrapped.get_env_state()['qpos'], env.unwrapped.get_env_state()['qpos']))[None, None, :]
+        key = jax.random.PRNGKey(seed)
+        for t in range(context_len):
+            sample_key, dropout_key, key = jax.random.split(key, 3)
+            z_t = dist_z_prior.sample(seed=sample_key)
+            a_dist_params = precoder.apply(model_params,
+                                    dummy_timesteps,
+                                    normalize_obs(s_t),
+                                    # s_t,
+                                    z_t,
+                                    actions,
+                                    dummy_controlled_variables,
+                                    dummy_rtg,
+                                    (jnp.ones((1,1))*context_len).astype(jnp.int32),
+                                    rngs={'dropout': dropout_key})
+            a_mean, _ = jnp.split(a_dist_params, 2, axis=-1)
+            actions = actions.at[:,t,:].set(jnp.tanh(a_mean[:,t,:]))
+
+        import imageio
+        frames = []
+        for t in range(context_len):
+            frames.append(env.render())
+            obs, rew, terminated, truncated, info = env.step(actions[0,t,:])
+
+        imageio.mimsave('output_video' + model + '.mp4', frames, fps=30)
+
+        from matplotlib import pyplot as plt
+        for i in range(actions.shape[-1]):
+            plt.plot(actions[0,:,i])
+        plt.savefig('action' + model + '.png')
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
@@ -923,11 +1000,12 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_dir', type=str, default='data/')
     parser.add_argument('--log_dir', type=str, default='dt_runs/')
 
-    parser.add_argument('--context_len', type=int, default=20)
+    parser.add_argument('--context_len', type=int, default=50)
     parser.add_argument('--n_blocks', type=int, default=3)
     parser.add_argument('--embed_dim', type=int, default=128)
     parser.add_argument('--n_heads', type=int, default=1)
     parser.add_argument('--dropout_p', type=float, default=0.1)
+    parser.add_argument('--dynamics_dropout_p', type=float, default=0.1)
     parser.add_argument('--gradient_clipping', type=float, default=0.25)
 
     parser.add_argument('--batch_size', type=int, default=64)
