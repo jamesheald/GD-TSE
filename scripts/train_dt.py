@@ -111,18 +111,17 @@ def train(args):
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
 
-    # prefix = "dt_" + env_d4rl_name
-    # start_time_str = '25-06-17-20-33-22'
-    # log_dir = os.path.join(args.log_dir, prefix, f'seed_{seed}', start_time_str)
+    prefix = "dt_" + env_d4rl_name
+    start_time_str = '25-06-19-17-34-48'
+    log_dir = os.path.join(args.log_dir, prefix, f'seed_{seed}', start_time_str)
 
     start_time = datetime.now().replace(microsecond=0)
     start_time_str = start_time.strftime("%y-%m-%d-%H-%M-%S")
 
-    prefix = "dt_" + env_d4rl_name
-
-    log_dir = os.path.join(log_dir, prefix, f'seed_{seed}', start_time_str)
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
+    # prefix = "dt_" + env_d4rl_name
+    # log_dir = os.path.join(log_dir, prefix, f'seed_{seed}', start_time_str)
+    # if not os.path.exists(log_dir):
+    #     os.makedirs(log_dir)
 
     log_csv_name = "log.csv"
     log_csv_path = os.path.join(log_dir, log_csv_name)
@@ -210,134 +209,23 @@ def train(args):
         data=jnp.concatenate(replay_buffer_data, axis=0).reshape(local_devices_to_use, -1, max_epi_len + context_len, trans_dim)
     ) # (local_devices_to_use, num_epi, max_epi_len + context_len, trans_dim)
 
-    ###################################### dynamics training ###################################### 
+    ###################################### dynamics ###################################### 
 
-    # total_updates = 100000
-    # load_model_path = os.path.join(log_dir, "dynamics_model.pt")
-    # load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
-    # _dynamics_params = load_params(load_current_model_path)
+    import mujoco
+    from mujoco import mjx
 
-    dynamics_model = make_transformer_networks(
-        state_dim=state_dim,
-        act_dim=act_dim,
-        controlled_variables_dim=controlled_variables_dim,
-        n_blocks=n_blocks,
-        h_dim=embed_dim,
-        context_len=context_len,
-        n_heads=n_heads,
-        drop_p=dropout_p,
-        trajectory_version=args.trajectory_version,
-        transformer_type='dynamics'
-    )
+    import minari
+    dataset = minari.load_dataset('D4RL/relocate/expert-v2')
+    env = dataset.recover_environment(render_mode='rgb_array')
+    mj_model = env.unwrapped.model
+    mj_data = mujoco.MjData(mj_model)
+    mjx_model = mjx.put_model(mj_model)
+    mjx_data = mjx.put_data(mj_model, mj_data)
 
-    schedule_fn = optax.polynomial_schedule(
-        init_value=lr * 1 / warmup_steps,
-        end_value=lr,
-        power=1,
-        transition_steps=warmup_steps,
-        transition_begin=0
-    )
-    dynamics_optimizer = optax.chain(
-        optax.clip(args.gradient_clipping),
-        optax.adamw(learning_rate=schedule_fn, weight_decay=wt_decay),
-    )
-    key_params, key_dropout = jax.random.split(global_key)
-    dynamics_params = dynamics_model.init({'params': key_params, 'dropout': key_dropout})
-    dynamics_optimizer_state = dynamics_optimizer.init(dynamics_params)
-
-    # count the number of parameters
-    param_count = sum(x.size for x in jax.tree_util.tree_leaves(dynamics_params))
-    print(f'num_dynamics_param: {param_count}')
-
-    dynamics_optimizer_state, dynamics_params = bcast_local_devices(
-        (dynamics_optimizer_state, dynamics_params), local_devices_to_use)
-
-    def dynamics_loss(dynamics_params: Any,
-                   transitions: Transition, key: jnp.ndarray) -> jnp.ndarray:
-        ts = transitions.ts.reshape(transitions.ts.shape[:2]).astype(jnp.int32)  # (batch_size_per_device, context_len)
-        s_t = transitions.s_t  # (batch_size_per_device, context_len, state_dim)
-        a_t = transitions.a_t  # (batch_size_per_device, context_len, action_dim)
-        rtg_t = transitions.rtg_t  # (batch_size_per_device, context_len, 1)
-        mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
-        
-        horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
-        if args.trajectory_version:
-            y_t = transitions.y_t  # (batch_size_per_device, context_len, controlled_variables_dim)
-            dummy_z_t = jnp.zeros((batch_size, context_len * controlled_variables_dim))
-        else:
-            def slice_fn(y_t_b, start_t):
-                return jax.lax.dynamic_slice(y_t_b, (start_t, 0), (1, controlled_variables_dim))  # (1, D)
-            start_ts = (horizon - 1).squeeze(-1)  # shape: (B,)
-            y_t = jax.vmap(slice_fn)(transitions.y_t, start_ts)  # (B, 1, D) y_t = transitions.y_t[:,horizon-1:horizon,:]
-            dummy_z_t = jnp.zeros((batch_size, controlled_variables_dim))
-
-        y_p = dynamics_model.apply(dynamics_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, rngs={'dropout': key})
-
-        def true_fn(y_mean, y_log_std, y_t):
-            dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
-            return dist.log_prob(y_t)
-
-        def false_fn(y_mean, y_log_std, y_t):
-            return 0.
-        
-        def get_log_prob(mask, y_mean, y_log_std, y_t):
-            log_prob = jax.lax.cond(mask, true_fn, false_fn, y_mean, y_log_std, y_t)
-            return log_prob
-        batch_get_log_prob = jax.vmap(get_log_prob)
-
-        y_mean, y_log_std = jnp.split(y_p, 2, axis=-1)
-        min_log_std = -20.
-        max_log_std = 2.
-        y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
-        y_mean = y_mean.reshape(-1, controlled_variables_dim)
-        y_log_std = y_log_std.reshape(-1, controlled_variables_dim)
-        y_t = y_t.reshape(-1, controlled_variables_dim)
-        
-        if args.trajectory_version:
-            valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
-            log_probs = batch_get_log_prob(valid_mask, y_mean, y_log_std, y_t)
-            loss = jnp.sum(-log_probs * valid_mask) / jnp.sum(valid_mask)
-        else:
-            log_probs = jax.vmap(true_fn)(y_mean, y_log_std, y_t)
-            loss = jnp.mean(-log_probs)
-
-        return loss
-
-    dynamics_grad = jax.jit(jax.value_and_grad(dynamics_loss))
-
-    @jax.jit
-    def update_step(
-        state: TrainingState,
-        transitions: jnp.ndarray,
-    ) -> Tuple[TrainingState, bool, Dict[str, jnp.ndarray]]:
-
-        cumsum_dims = np.cumsum([state_dim, act_dim, controlled_variables_dim, 1, 1, 1])
-
-        transitions = Transition(
-            s_t=transitions[:, :, :cumsum_dims[0]],
-            a_t=transitions[:, :, cumsum_dims[0]:cumsum_dims[1]],
-            y_t=transitions[:, :, cumsum_dims[1]:cumsum_dims[2]],
-            rtg_t=transitions[:, :, cumsum_dims[2]:cumsum_dims[3]],
-            ts=transitions[:, :, cumsum_dims[3]:cumsum_dims[4]],
-            mask_t=transitions[:, :, cumsum_dims[4]:cumsum_dims[5]]
-        )
-
-        key, key_dynamics = jax.random.split(state.key, 2)
-
-        loss, dynamics_grads = dynamics_grad(state.params, transitions, key_dynamics)
-        dynamics_grads = jax.lax.pmean(dynamics_grads, axis_name='i')
-        dynamics_params_update, dynamics_optimizer_state = dynamics_optimizer.update(
-            dynamics_grads, state.optimizer_state, state.params)
-        dynamics_params = optax.apply_updates(state.params, dynamics_params_update)
-
-        metrics = {'loss': loss}
-
-        new_state = TrainingState(
-            optimizer_state=dynamics_optimizer_state,
-            params=dynamics_params,
-            key=key,
-            steps=state.steps + 1)
-        return new_state, metrics
+    # differentiation compatabile solver settings - https://github.com/google-deepmind/mujoco/issues/1182
+    mjx_model = mjx_model.replace(opt=mjx_model.opt.replace(solver=mujoco.mjtSolver.mjSOL_NEWTON))
+    mjx_model = mjx_model.replace(opt=mjx_model.opt.replace(iterations=1))
+    mjx_model = mjx_model.replace(opt=mjx_model.opt.replace(ls_iterations=1))
 
     def sample_data(training_state, replay_buffer, max_epi_len):
         # num_updates_per_iter
@@ -366,97 +254,12 @@ def train(args):
         training_state = training_state.replace(key=key3)
         return training_state, transitions
 
-    def run_one_epoch(carry, unused_t, max_epi_len):
-        training_state, replay_buffer = carry
-
-        training_state, transitions = sample_data(training_state, replay_buffer, max_epi_len)
-        training_state, metrics = jax.lax.scan(
-            update_step, training_state, transitions, length=1)
-        return (training_state, replay_buffer), metrics
-
-    def run_training(training_state, replay_buffer, max_epi_len):
-        synchro = is_replicated(
-            training_state.replace(key=jax.random.PRNGKey(0)), axis_name='i')
-        (training_state, replay_buffer), metrics = jax.lax.scan(
-            partial(run_one_epoch, max_epi_len=max_epi_len), (training_state, replay_buffer), (),
-            length=num_updates_per_iter)
-        metrics = jax.tree_util.tree_map(jnp.mean, metrics)
-        return training_state, replay_buffer, metrics, synchro
-    
-    run_training = jax.pmap(partial(run_training, max_epi_len=max_epi_len), axis_name='i')
-
-    training_state = TrainingState(
-        optimizer_state=dynamics_optimizer_state,
-        params=dynamics_params,
-        key=jnp.stack(jax.random.split(local_key, local_devices_to_use)),
-        steps=jnp.zeros((local_devices_to_use,)))
-
-    total_updates = 0
-
     wandb.init(
             name=f'{env_d4rl_name}-{random.randint(int(1e5), int(1e6) - 1)}',
             group=env_d4rl_name,
             project='jax_dt',
             config=args
         )
-    
-    save_model_path = os.path.join(log_dir, "dynamics_model.pt")
-
-    for i_train_iter in range(max_train_iters):
-        log_dynamics_losses = []
-
-        # optimization
-        training_state, replay_buffer, training_metrics, synchro = run_training(
-            training_state, replay_buffer)
-        assert synchro[0], (current_step, training_state)
-        jax.tree_util.tree_map(lambda x: x.block_until_ready(), training_metrics)
-        log_dynamics_losses.append(training_metrics['loss'])
-
-        mean_dynamics_loss = np.mean(log_dynamics_losses)
-        time_elapsed = str(datetime.now().replace(microsecond=0) - start_time)
-
-        total_updates += num_updates_per_iter
-
-        log_str = ("=" * 60 + '\n' +
-                   "time elapsed: " + time_elapsed  + '\n' +
-                   "train iter: " + str(i_train_iter)  + '\n' +
-                   "num of updates: " + str(total_updates) + '\n' +
-                   "dynamics loss: " +  format(mean_dynamics_loss, ".5f") + '\n'
-                )
-
-        print(log_str)
-
-        wandb.log({'mean_dynamics_loss': mean_dynamics_loss})
-
-        log_data = [
-            time_elapsed,
-            total_updates,
-            mean_dynamics_loss,
-        ]
-
-        csv_writer.writerow(log_data)
-
-        # save model
-        _dynamics_params = jax.tree_util.tree_map(lambda x: x[0], training_state.params)
-
-        if i_train_iter % args.dynamics_save_iters == 0 or i_train_iter == max_train_iters - 1:
-            save_current_model_path = save_model_path[:-3] + f"_{total_updates}.pt"
-            print("saving current model at: " + save_current_model_path)
-            save_params(save_current_model_path, _dynamics_params)
-
-    synchronize_hosts()
-    
-    print("=" * 60)
-    print("finished training dynamics!")
-    print("=" * 60)
-    end_time = datetime.now().replace(microsecond=0)
-    time_elapsed = str(end_time - start_time)
-    end_time_str = end_time.strftime("%y-%m-%d-%H-%M-%S")
-    print("started training dynamics at: " + start_time_str)
-    print("finished training dynamics at: " + end_time_str)
-    print("total dynamics training time: " + time_elapsed)
-    print("saved last updated model at: " + save_model_path)
-    print("=" * 60)
 
     ###################################### vae training ###################################### 
 
@@ -507,8 +310,6 @@ def train(args):
                                 rtg_t=dummy_rtg,
                                 horizon=dummy_horizon,
                                 mask=dummy_mask,
-                                dynamics_apply=dynamics_model.apply,
-                                dynamics_params=_dynamics_params,
                                 key=key_params)
     
     vae_optimizer_state = vae_optimizer.init(vae_params)
@@ -541,7 +342,7 @@ def train(args):
 
         vae_key, dropout_key = jax.random.split(key, 2)
 
-        decoder_loss, kl_loss = vae_model.apply(vae_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, vae_key, rngs={'dropout': dropout_key})
+        decoder_loss, kl_loss = vae_model.apply(vae_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, vae_key, rngs={'dropout': dropout_key})
 
         return decoder_loss + kl_loss, (decoder_loss, kl_loss)
 
@@ -601,7 +402,6 @@ def train(args):
         return training_state, replay_buffer, metrics, synchro
     
     run_training_vae = jax.pmap(partial(run_training_vae, max_epi_len=max_epi_len), axis_name='i')
-    # run_training_vae = partial(run_training_vae, max_epi_len=max_epi_len)
 
     vae_training_state = TrainingState(
         optimizer_state=vae_optimizer_state,
@@ -612,13 +412,6 @@ def train(args):
         # steps=jnp.zeros(1))
 
     total_updates = 0
-
-    # wandb.init(
-    #         name=f'{env_d4rl_name}-{random.randint(int(1e5), int(1e6) - 1)}',
-    #         group=env_d4rl_name,
-    #         project='jax_dt',
-    #         config=args
-    #     )
 
     save_model_path = os.path.join(log_dir, "vae_model.pt")
 
@@ -700,7 +493,8 @@ def train(args):
         h_dim=embed_dim,
         context_len=context_len,
         n_heads=n_heads,
-        drop_p=dropout_p
+        drop_p=dropout_p,
+        model=mjx_model
     )
 
     schedule_fn = optax.polynomial_schedule(
@@ -728,6 +522,14 @@ def train(args):
     dummy_rtg = jnp.zeros((batch_size, context_len, 1))
     dummy_horizon= jnp.zeros((batch_size, 1), dtype=jnp.int32)
     dummy_mask = jnp.zeros((batch_size, context_len, 1))
+    dummy_mjx_data = jax.vmap(lambda init_qpos: mjx_data.replace(qpos=init_qpos))(jnp.zeros((batch_size, mjx_data.qpos.shape[0])))
+
+    # from decision_transformer.dt.model import MJXRollout
+    # dynamics = MJXRollout(model=mjx_model)
+    # y_samp = dynamics(dummy_actions, dummy_mjx_data)
+    # get_jacobian = jax.jit(jax.jacrev(dynamics))
+    # y_samp_grad = get_jacobian(dummy_actions, dummy_mjx_data)
+    # breakpoint()
 
     key_params, key_dropout = jax.random.split(global_key_emp)
     emp_params = emp_model.init({'params': key_params, 'dropout': key_dropout},
@@ -739,8 +541,7 @@ def train(args):
                                 rtg_t=dummy_rtg,
                                 horizon=dummy_horizon,
                                 mask=dummy_mask,
-                                dynamics_apply=dynamics_model.apply,
-                                dynamics_params=_dynamics_params,
+                                mjx_data=dummy_mjx_data,
                                 key=key_params)
 
     total_updates = 1000
@@ -782,7 +583,13 @@ def train(args):
 
         emp_key, dropout_key = jax.random.split(key, 2)
 
-        loss = emp_model.apply(emp_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, emp_key, rngs={'dropout': dropout_key})
+        s_t_unnorm = s_t * state_std + state_mean
+        qpos, qvel = jnp.split(s_t_unnorm[:,0,:], 2, axis=-1)
+
+        batch_mjx_data = batch_mjx_data.replace(qpos=qpos)
+        batch_mjx_data = batch_mjx_data.replace(qvel=qvel)
+
+        loss = emp_model.apply(emp_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, batch_mjx_data, emp_key, rngs={'dropout': dropout_key})
 
         return loss
 
@@ -852,7 +659,9 @@ def train(args):
 
     total_updates = 0
 
-    save_model_path = os.path.join(log_dir, "emp_model_tanh.pt")
+    save_model_path = os.path.join(log_dir, "emp_model.pt")
+
+    batch_mjx_data = jax.vmap(lambda init_qpos: mjx_data.replace(qpos=init_qpos))(jnp.zeros((batch_size_per_device, mjx_data.qpos.shape[0])))
 
     for i_train_iter in range(max_train_iters):
         log_emp_losses = []
@@ -936,7 +745,7 @@ if __name__ == "__main__":
     parser.add_argument('--wt_decay', type=float, default=1e-4)
     parser.add_argument('--warmup_steps', type=int, default=10000)
 
-    parser.add_argument('--max_train_iters', type=int, default=1_000)
+    parser.add_argument('--max_train_iters', type=int, default=10)
     parser.add_argument('--num_updates_per_iter', type=int, default=100)
     parser.add_argument('--dynamics_save_iters', type=int, default=100)
     parser.add_argument('--vae_save_iters', type=int, default=100)

@@ -14,11 +14,43 @@ import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
 tfb = tfp.bijectors
 
+import jax
+from mujoco import mjx
+
+@dataclasses.dataclass
+class MJXRollout:
+    model: mjx.Model  # Assumes mjx_model is an instance of mjx.Model
+
+    def __call__(self, ctrl_seq, data):
+        """
+        Perform a rollout over a sequence of control inputs.
+
+        Args:
+            ctrl_seq: (T, act_dim) array of control inputs.
+            data: Initial mjx.Data state.
+
+        Returns:
+            Array of qpos[-6:] at each step: shape (T, 6)
+        """
+        def peform_rollout(ctrl_seq, data):
+            
+            def step_fn(data, ctrl):
+                data = data.replace(ctrl=ctrl)
+                data = mjx.step(self.model, data)
+                return data, data.qpos[-6:]
+
+            _, controlled_variables = jax.lax.scan(step_fn, data, ctrl_seq)
+            
+            return controlled_variables
+        
+        batch_peform_rollout = jax.vmap(peform_rollout)
+        
+        return batch_peform_rollout(ctrl_seq, data)
+
 @dataclasses.dataclass
 class FeedForwardModel:
     init: Any
     apply: Any
-
 
 class MaskedCausalAttention(linen.Module):
     h_dim: int
@@ -434,7 +466,7 @@ class VAE(linen.Module):
                                     drop_p=self.drop_p,
                                     transformer_type='action_decoder')
 
-    def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_apply, dynamics_params, key):
+    def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, key):
         
         ###################### encode ###################### 
         z_dist_params = self.encoder(ts, s_t, z_t, a_t, y_t, rtg_t, horizon)
@@ -474,14 +506,16 @@ class VAE(linen.Module):
         batch_get_log_prob = jax.vmap(get_log_prob)
         
         a_t = a_t.reshape(-1, self.act_dim)
-        a_t = jnp.clip(a_t, -1+1e-6, -1+1e-6)
+        a_t = jnp.clip(a_t, -1+1e-6, 1-1e-6)
         valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
         log_probs = batch_get_log_prob(valid_mask, a_mean, a_log_std, a_t)
         decoder_loss = jnp.sum(-log_probs * valid_mask) / jnp.sum(valid_mask)
+        decoder_loss /= (self.act_dim*self.context_len)
         
         # independent standard normal prior
         dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_mean.shape), scale_diag=jnp.ones(z_log_std.shape))
         kl_loss = tfd.kl_divergence(dist_z_post, dist_z_prior).mean()
+        kl_loss /= (self.act_dim*self.context_len)
 
         return decoder_loss, kl_loss
     
@@ -494,6 +528,7 @@ class empowerment(linen.Module):
     context_len: int
     n_heads: int
     drop_p: float
+    model: mjx.Model
 
     def setup(self):
 
@@ -516,8 +551,10 @@ class empowerment(linen.Module):
                                     n_heads=self.n_heads,
                                     drop_p=self.drop_p,
                                     transformer_type='action_decoder')
+        
+        self.dynamics = MJXRollout(model=self.model)
 
-    def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_apply, dynamics_params, key):
+    def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, mjx_data, key):
 
         dropout_key, sample_z_key, sample_y_key = jax.random.split(key, 3)
 
@@ -535,14 +572,7 @@ class empowerment(linen.Module):
             actions = actions.at[:,t,:].set(jnp.tanh(a_mean[:, t, :]))
 
         ###################### dynamics ###################### 
-        y_p = dynamics_apply(dynamics_params, ts, s_t, z_t, actions, y_t, rtg_t, horizon, rngs={'dropout': dropout_key})
-
-        y_mean, y_log_std = jnp.split(y_p, 2, axis=-1)
-        min_log_std = -20.
-        max_log_std = 2.
-        y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
-        dist_y = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
-        y_samp = dist_y.sample(seed=sample_y_key)
+        y_samp = self.dynamics(actions, mjx_data)
 
         ###################### sample controlled variable ###################### 
         z_dist_params = self.encoder(ts, s_t, z_t, a_t, y_samp, rtg_t, horizon)
@@ -558,5 +588,6 @@ class empowerment(linen.Module):
         log_prob_z = post_dist.log_prob(z_samp)
 
         loss = -jnp.mean(log_prob_z)
+        loss /= (z_samp.shape[-1])
         
         return loss

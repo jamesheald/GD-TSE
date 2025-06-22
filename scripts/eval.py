@@ -180,92 +180,122 @@ def train(args):
     dataset = minari.load_dataset('D4RL/relocate/expert-v2')
     env = dataset.recover_environment(render_mode='rgb_array')
 
-    vae_model = VAE(
-        state_dim=state_dim,
-        act_dim=act_dim,
-        controlled_variables_dim=controlled_variables_dim,
-        n_blocks=n_blocks,
-        h_dim=embed_dim,
-        context_len=context_len,
-        n_heads=n_heads,
-        drop_p=dropout_p
-    )
-
     prefix = "dt_" + env_d4rl_name
-    start_time_str = '25-06-17-20-33-22'
+    start_time_str = '25-06-19-17-34-48'
     log_dir = os.path.join(args.log_dir, prefix, f'seed_{seed}', start_time_str)
     total_updates = 100000
-    load_model_path = os.path.join(log_dir, "vae_model.pt")
-    load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
-    _vae_params = load_params(load_current_model_path)
+    for model in ['vae', 'emp']:
 
-    batch_size = 1
-    dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
-    dummy_states = jnp.zeros((batch_size, context_len, state_dim))
-    dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
-    if args.trajectory_version:
-        dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
-        dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
-    else:
-        dummy_latent = jnp.zeros((batch_size, controlled_variables_dim))
-        dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
-    dummy_rtg = jnp.zeros((batch_size, context_len, 1))
-    dummy_horizon= jnp.zeros((batch_size, 1), dtype=jnp.int32)
-    dummy_mask = jnp.zeros((batch_size, context_len, 1))
+        if model == 'vae':
+            load_model_path = os.path.join(log_dir, model + '_model.pt')
+            load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
+            _vae_params = load_params(load_current_model_path)
+            loaded_params = _vae_params['params']['decoder']
+        elif model == 'emp':
+            load_model_path = os.path.join(log_dir, model + '_model.pt')
+            load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
+            _vae_params = load_params(load_current_model_path)
+            loaded_params = _vae_params['params']['precoder']
 
-    precoder = Transformer(state_dim=state_dim,
-                            act_dim=act_dim,
-                            controlled_variables_dim=controlled_variables_dim,
-                            n_blocks=n_blocks,
-                            h_dim=embed_dim,
-                            context_len=context_len,
-                            n_heads=n_heads,
-                            drop_p=dropout_p,
-                            transformer_type='precoder')
+        batch_size = 1
+        dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
+        dummy_states = jnp.zeros((batch_size, context_len, state_dim))
+        dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
+        if args.trajectory_version:
+            dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
+            dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+        else:
+            dummy_latent = jnp.zeros((batch_size, controlled_variables_dim))
+            dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
+        dummy_rtg = jnp.zeros((batch_size, context_len, 1))
+        dummy_horizon= jnp.ones((batch_size, 1), dtype=jnp.int32)
+        dummy_mask = jnp.ones((batch_size, context_len, 1))
 
-    dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros((1,6)), scale_diag=jnp.ones((1,6)))
+        precoder = Transformer(state_dim=state_dim,
+                                act_dim=act_dim,
+                                controlled_variables_dim=controlled_variables_dim,
+                                n_blocks=n_blocks,
+                                h_dim=embed_dim,
+                                context_len=context_len,
+                                n_heads=n_heads,
+                                drop_p=dropout_p,
+                                transformer_type='action_decoder')
 
-    def normalize_obs(obs):
-        norm_obs = (obs - state_mean) / state_std
-        return norm_obs
+        dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros((1,6)), scale_diag=jnp.ones((1,6)))
 
-    actions = dummy_actions.copy()
-    env.reset()
-    # s_t = replay_buffer.data[0,:1,:1,:state_dim]
-    s_t = jnp.concatenate((env.unwrapped.get_env_state()['qpos'], env.unwrapped.get_env_state()['qpos']))[None, None, :]
-    key = jax.random.PRNGKey(seed)
-    for t in range(context_len):
-        sample_key, dropout_key, key = jax.random.split(key, 3)
-        z_t = dist_z_prior.sample(seed=sample_key)
-        outputs = precoder.apply({'params': _vae_params['params']['precoder']},
-                                 dummy_timesteps,
-                                 normalize_obs(s_t),
-                                 z_t,
-                                 actions,
-                                 dummy_controlled_variables,
-                                 dummy_rtg,
-                                 (jnp.ones((1,1))*context_len).astype(jnp.int32),
-                                 rngs={'dropout': dropout_key})
-        # actions = actions.at[:,t,:].set(outputs[:,t,:])
-        actions = actions.at[:,t,:].set(jnp.tanh(outputs[:,t,:]))
+        def normalize_obs(obs):
+            norm_obs = (obs - state_mean) / state_std
+            return norm_obs
 
-    # dist_actions = tfd.MultivariateNormalDiag(loc=jnp.zeros((1,context_len,30)), scale_diag=jnp.ones((1,context_len,30)))
-    # actions = dist_actions.sample(seed=sample_key)
+        actions = jnp.zeros((batch_size, context_len, act_dim))
+        env.reset()
+        # s_t = replay_buffer.data[0,:1,:1,:state_dim]
+        s_t = jnp.concatenate((env.unwrapped.get_env_state()['qpos'], env.unwrapped.get_env_state()['qpos']))[None, None, :]
+        key = jax.random.PRNGKey(seed)
 
-    import imageio
-    frames = []
-    for t in range(context_len):
-        frames.append(env.render())
-        obs, rew, terminated, truncated, info = env.step(actions[0,t,:])
+        import imageio
+        frames = []
+        for t in range(200):
+            frames.append(env.render())
+            sample_key, dropout_key, key = jax.random.split(key, 3)
+            z_t = dist_z_prior.sample(seed=sample_key)
+            s_t = jnp.concatenate((env.unwrapped.get_env_state()['qpos'], env.unwrapped.get_env_state()['qpos']))[None, None, :]
+            a_dist_params = precoder.apply({'params': loaded_params},
+                                    dummy_timesteps,
+                                    normalize_obs(s_t),
+                                    z_t,
+                                    actions,
+                                    dummy_controlled_variables,
+                                    dummy_rtg,
+                                    (jnp.ones((1,1))*context_len).astype(jnp.int32),
+                                    rngs={'dropout': dropout_key})
+            a_mean, _ = jnp.split(a_dist_params, 2, axis=-1)
+            obs, rew, terminated, truncated, info = env.step(jnp.tanh(a_mean[0, 0, :]))
 
-    imageio.mimsave('output_video_vae.mp4', frames, fps=30)
+        # for t in range(context_len):
+        #     sample_key, dropout_key, key = jax.random.split(key, 3)
+        #     z_t = dist_z_prior.sample(seed=sample_key)
+        #     a_dist_params = precoder.apply({'params': loaded_params},
+        #                             dummy_timesteps,
+        #                             normalize_obs(s_t),
+        #                             z_t,
+        #                             actions,
+        #                             dummy_controlled_variables,
+        #                             dummy_rtg,
+        #                             (jnp.ones((1,1))*context_len).astype(jnp.int32),
+        #                             rngs={'dropout': dropout_key})
+        #     a_mean, _ = jnp.split(a_dist_params, 2, axis=-1)
+        #     actions = actions.at[:,t,:].set(jnp.tanh(a_mean[:, t, :]))
         
-    breakpoint()
+        # for t in range(context_len):
+        #     sample_key, dropout_key, key = jax.random.split(key, 3)
+        #     z_t = dist_z_prior.sample(seed=sample_key)
+        #     a_dist_params = precoder.apply({'params': loaded_params},
+        #                             dummy_timesteps,
+        #                             normalize_obs(s_t),
+        #                             z_t,
+        #                             actions,
+        #                             dummy_controlled_variables,
+        #                             dummy_rtg,
+        #                             (jnp.ones((1,1))*context_len).astype(jnp.int32),
+        #                             rngs={'dropout': dropout_key})
+        #     a_mean, _ = jnp.split(a_dist_params, 2, axis=-1)
+        #     actions = actions.at[:,t,:].set(jnp.tanh(a_mean[:, t, :]))
 
-    # from matplotlib import pyplot as plt
-    # for i in range(actions.shape[-1]):
-    #     plt.plot(actions[0,:,i])
-    # plt.savefig('action.png')
+        # import imageio
+        # frames = []
+        # for t in range(context_len):
+        #     frames.append(env.render())
+        #     obs, rew, terminated, truncated, info = env.step(actions[0,t,:])
+
+        imageio.mimsave('output_video_' + model + '.mp4', frames, fps=30)
+        
+        from matplotlib import pyplot as plt
+        for i in range(actions.shape[-1]):
+            plt.plot(actions[0,:,i])
+        plt.savefig(model+'action.png')
+    
+    breakpoint()
 
 
 if __name__ == "__main__":
