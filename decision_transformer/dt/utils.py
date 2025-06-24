@@ -34,7 +34,7 @@ class Transition:
     """Contains data for contextual-BC training step."""
     s_t: jnp.ndarray
     a_t: jnp.ndarray
-    y_t: jnp.ndarray
+    s_tp1: jnp.ndarray
     rtg_t: jnp.ndarray
     ts: jnp.ndarray
     mask_t: jnp.ndarray

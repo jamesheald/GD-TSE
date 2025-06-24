@@ -28,18 +28,15 @@ for env_name in ['relocate']:
 				final_timestep = dataset['timeouts'][i]
 			else:
 				final_timestep = (episode_step == 1000-1)
-			for k in ['observations', 'actions', 'rewards', 'terminals', 'timeouts', 'infos/qvel']: # 'infos/hand_qpos', 'infos/obj_pos', 'infos/palm_pos', 'infos/qpos', 'infos/target_pos']:
-				if k == 'infos/qvel':
-					if i != N-1:
-						if done_bool or final_timestep:
-							# next controlled variables doesn't exist if last timestep (use nan)
-							data_['next_controlled_variables'].append(np.full(dataset[k][i+1][-6:].shape, np.nan))
-						else:
-							data_['next_controlled_variables'].append(dataset[k][i+1][-6:])
+			for k in ['observations', 'actions', 'next_observations', 'rewards', 'terminals', 'timeouts', 'infos/target_pos']: # 'infos/hand_qpos', 'infos/obj_pos', 'infos/palm_pos', 'infos/qpos', 'infos/qvel', 'infos/target_pos']:
+				if (i != N-1) and not (done_bool or final_timestep):
+					if k == 'next_observations':
+						# data_['next_controlled_variables'].append(dataset[k][i+1][-6:])
+						data_[k].append(np.concatenate((dataset['infos/qpos'][i+1], dataset['infos/qvel'][i+1])))
+					elif k == 'observations':
+						data_[k].append(np.concatenate((dataset['infos/qpos'][i], dataset['infos/qvel'][i])))
 					else:
-						data_['next_controlled_variables'].append(np.full(dataset[k][i][-6:].shape, np.nan))
-				else:
-					data_[k].append(dataset[k][i])
+						data_[k].append(dataset[k][i])
 			if done_bool or final_timestep:
 				episode_step = 0
 				episode_data = {}
@@ -54,5 +51,5 @@ for env_name in ['relocate']:
 		print(f'Number of samples collected: {num_samples}')
 		print(f'Trajectory returns: mean = {np.mean(returns)}, std = {np.std(returns)}, max = {np.max(returns)}, min = {np.min(returns)}')
 
-		with open(f'{name}.pkl', 'wb') as f:
+		with open(f'{name}-fullnextstate.pkl', 'wb') as f:
 			pickle.dump(paths, f)

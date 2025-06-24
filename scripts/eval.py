@@ -192,10 +192,10 @@ def train(args):
     )
 
     prefix = "dt_" + env_d4rl_name
-    start_time_str = '25-06-22-16-40-51'
+    start_time_str = '25-06-22-21-02-32'
     log_dir = os.path.join(args.log_dir, prefix, f'seed_{seed}', start_time_str)
-    total_updates = 25000
-    for model in ['emp_model_tanh']: # 'vae_model'
+    total_updates = 100000
+    for model in ['vae_model']: # 'vae_model'
         load_model_path = os.path.join(log_dir, model + ".pt")
         load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
         _vae_params = load_params(load_current_model_path)
@@ -230,6 +230,11 @@ def train(args):
             norm_obs = (obs - state_mean) / state_std
             return norm_obs
         
+        if model == 'vae_model':
+            model_params = {'params': _vae_params['params']['decoder']}
+        elif model == 'emp':
+            model_params = {'params': _vae_params['params']['precoder']}
+        
         actions = dummy_actions.copy()
         env.reset()
         s_t = replay_buffer.data[0,:1,:1,:state_dim]
@@ -238,8 +243,7 @@ def train(args):
         for t in range(context_len):
             sample_key, dropout_key, key = jax.random.split(key, 3)
             z_t = dist_z_prior.sample(seed=sample_key)
-            # a_dist_params = precoder.apply({'params': _vae_params['params']['decoder']},
-            a_dist_params = precoder.apply({'params': _vae_params['params']['precoder']},
+            a_dist_params = precoder.apply(model_params,
                                     dummy_timesteps,
                                     # normalize_obs(s_t),
                                     s_t,
@@ -282,7 +286,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_dir', type=str, default='data/')
     parser.add_argument('--log_dir', type=str, default='dt_runs/')
 
-    parser.add_argument('--context_len', type=int, default=20)
+    parser.add_argument('--context_len', type=int, default=50)
     parser.add_argument('--n_blocks', type=int, default=3)
     parser.add_argument('--embed_dim', type=int, default=128)
     parser.add_argument('--n_heads', type=int, default=1)

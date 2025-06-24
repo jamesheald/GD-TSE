@@ -8,11 +8,37 @@ import jax.numpy as jnp
 
 from flax import linen
 from flax.linen.initializers import lecun_normal, zeros
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 
 import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
 tfb = tfp.bijectors
+
+from functools import partial
+
+class dynamics(linen.Module):
+    h_dims_dynamics: List
+    state_dim: int
+    drop_out_rates: List
+    deterministic: bool = False
+    
+    def setup(self):
+
+        self.dynamics = [linen.Sequential([linen.Dense(features=h_dim), linen.LayerNorm(), linen.relu]) for h_dim in self.h_dims_dynamics]
+        self.dynamics_out = linen.Dense(features=self.state_dim*2)
+
+        self.dropout = [linen.Dropout(rate=layer_i_rate) for layer_i_rate in self.drop_out_rates] 
+
+    def __call__(self, obs, actions):
+
+        x = jnp.concatenate((obs, actions), axis=-1)
+        for i, fn in enumerate(self.dynamics):
+            x = fn(x)
+            if self.drop_out_rates[i] > 0.:
+                x = self.dropout[i](x, self.deterministic)
+        x = self.dynamics_out(x)
+
+        return x
 
 @dataclasses.dataclass
 class FeedForwardModel:
@@ -64,8 +90,8 @@ class MaskedCausalAttention(linen.Module):
             # mask == True --> weights, mask == False --> -jnp.inf
             weights = jnp.where(self.mask[..., :T, :T], weights, -jnp.inf)
         else:
-            weights = jnp.where(jax.vmap(lambda x: jnp.outer(x, x).reshape(1, self.max_T, self.max_T))(mask)[..., :T, :T], weights, -jnp.inf)
-        # normalize weights, all -inf -> 0 after softmax
+            weights = jnp.where(jax.vmap(lambda x: jnp.outer(x, x).reshape(1, self.max_T, self.max_T))(mask)[..., :T, :T], weights, -1e30)
+        # normalize weights, all -1e30 -> 0 after softmax
         normalized_weights = jax.nn.softmax(weights, axis=-1)
 
         attention = linen.Dropout(
@@ -166,6 +192,8 @@ class Transformer(linen.Module):
         
         if self.transformer_type == 'encoder':
             max_T = next_controlled_variables.shape[1] + 1 # + 1 for initial state
+        elif self.transformer_type == 'vae_encoder':
+            max_T = actions.shape[1] + next_controlled_variables.shape[1] + 1 # + 1 for initial state
         else:
             max_T = self.context_len + 1 # + 1 for initial state
 
@@ -201,26 +229,42 @@ class Transformer(linen.Module):
             # (B x [T + 1] x h_dim)
             h = jnp.concatenate((initial_state_embedding[:,None,:], controlled_variables_embeddings), axis=1)
 
-        elif self.transformer_type == 'action_encoder': # infer latent variable z_0 given s_0, a_0, ..., a_H-1
+        elif self.transformer_type == 'vae_encoder': # infer latent variable z_0 given s_0, a_0, ..., a_H-1
 
             # condiiton the encoder on the horizon length
             # currently conditioning by adding horizon embeddings
             # an alternative is to add a seperate horizon embedding token and allow other variables to attend to it
             initial_state_embedding += horizon_embeddings.squeeze()
+
+            controlled_variables_embeddings = linen.Dense(
+                self.h_dim,
+                dtype=self.dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init)(next_controlled_variables) 
+            controlled_variables_embeddings += positional_embeddings[:,1:next_controlled_variables.shape[1]+1:,:] 
+            controlled_variables_embeddings += horizon_embeddings
             
             action_embeddings = linen.Dense(
                 self.h_dim,
                 dtype=self.dtype,
                 kernel_init=self.kernel_init,
                 bias_init=self.bias_init)(actions) 
-            action_embeddings += positional_embeddings[:,1:,:] 
+            action_embeddings += positional_embeddings[:,next_controlled_variables.shape[1]+1:,:] 
             action_embeddings += horizon_embeddings
-            
+
+            # stacked = jnp.stack([controlled_variables_embeddings, action_embeddings], axis=2)
+            # # Step 2: Reshape to interleave along axis=1 → (B, 2T, D)
+            # interleaved = stacked.reshape(stacked.shape[0], -1, stacked.shape[-1])
+            # # Step 3: Expand initial_state_embedding to shape (B, 1, D)
+            # initial_expanded = initial_state_embedding[:, None, :]
+            # # Step 4: Concatenate along time axis
+            # h = jnp.concatenate([initial_expanded, interleaved], axis=1)
+                        
             # concatenate initial state and actions
             # (s_0, a_0, ..., a_H-1)
             # (B x [T + 1] x h_dim)
-            h = jnp.concatenate((initial_state_embedding[:,None,:], action_embeddings), axis=1)
-        
+            h = jnp.concatenate((initial_state_embedding[:,None,:], controlled_variables_embeddings, action_embeddings), axis=1)
+
         elif self.transformer_type == 'precoder' or self.transformer_type == 'action_decoder': # generate action variable a_h given s_0, z_0, a_0, ..., a_h-1
             
             initial_state_embedding += horizon_embeddings.squeeze()
@@ -263,13 +307,18 @@ class Transformer(linen.Module):
 
         h = linen.LayerNorm(dtype=self.dtype)(h)
 
-        # first_elem = mask[:, :1, :]
-        # padded_mask = jnp.concatenate([first_elem, mask], axis=1)
-        if next_controlled_variables.shape[1] == 1 and self.transformer_type == 'encoder': # in this setting, padded_mask plays no role (multiply by 1)
-            padded_mask = jnp.ones((B, max_T, 1), dtype=jnp.float32)
+        arange = jnp.arange(max_T)[None, :]
+        if self.transformer_type == 'encoder':
+            padded_mask = jnp.concatenate((jnp.ones((B,1)),
+                                           arange[:,:next_controlled_variables.shape[1]] < horizon),
+                                           axis=-1).astype(jnp.float32)[..., None]
+        if self.transformer_type == 'vae_encoder':
+            padded_mask = jnp.concatenate((jnp.ones((B,1)),
+                                           arange[:,:next_controlled_variables.shape[1]] < horizon,
+                                           arange[:,:actions.shape[1]] < horizon),
+                                           axis=-1).astype(jnp.float32)[..., None]
         else:
-            arange = jnp.arange(max_T)[None, :]  # Shape: (1, T)
-            padded_mask = (arange <= horizon).astype(jnp.float32)[..., None]  # Shape: (B, T, 1)
+            padded_mask = jnp.zeros(1) # dummy
         
         # transformer and prediction
         for _ in range(self.n_blocks):
@@ -278,9 +327,9 @@ class Transformer(linen.Module):
                 max_T=max_T,
                 n_heads=self.n_heads,
                 drop_p=self.drop_p,
-                use_causal_mask=False if self.transformer_type == 'encoder' else True)(h, padded_mask)
+                use_causal_mask=False if (self.transformer_type == 'encoder' or self.transformer_type == 'vae_encoder') else True)(h, padded_mask)
             
-        if self.transformer_type == 'encoder' or self.transformer_type == 'action_encoder':
+        if self.transformer_type == 'encoder' or self.transformer_type == 'vae_encoder':
             # Multiply to zero-out unmasked values
             h_masked = h * padded_mask  # shape (B, T, D)
 
@@ -406,6 +455,7 @@ class VAE(linen.Module):
     state_dim: int
     act_dim: int
     controlled_variables_dim: int
+    controlled_variables: List
     n_blocks: int
     h_dim: int
     context_len: int
@@ -422,7 +472,7 @@ class VAE(linen.Module):
                                     context_len=self.context_len,
                                     n_heads=self.n_heads,
                                     drop_p=self.drop_p,
-                                    transformer_type='action_encoder')
+                                    transformer_type='vae_encoder')
 
         self.decoder = Transformer(state_dim=self.state_dim,
                                     act_dim=self.act_dim,
@@ -435,58 +485,134 @@ class VAE(linen.Module):
                                     transformer_type='action_decoder')
 
     def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_apply, dynamics_params, key):
+
+        def true_fn(x_mean, x_log_std, x_t, key=None):
+            x_dist = tfd.MultivariateNormalDiag(loc=x_mean, scale_diag=jnp.exp(x_log_std))
+            if key is not None:
+                x_dist = tfd.TransformedDistribution(distribution=x_dist, bijector=tfb.Tanh())
+                x_samp = x_dist.sample(seed=key)
+            else:
+                x_samp = jnp.zeros(x_t.shape)
+            return x_dist.log_prob(x_t), x_samp
+
+        def false_fn(x_mean, x_log_std, x_t, key=None):
+            return 0., jnp.zeros(x_t.shape)
+        
+        def get_log_prob(mask, x_mean, x_log_std, x_t, key=None):
+            return jax.lax.cond(mask, true_fn, false_fn, x_mean, x_log_std, x_t, key)
+        batch_get_log_prob = jax.vmap(get_log_prob)
+
+        def reshape_variables(x_mean, x_log_std, x_t, dim):
+            x_mean = x_mean.reshape(-1, dim)
+            x_log_std = x_log_std.reshape(-1, dim)
+            x_t = x_t.reshape(-1, dim)
+            return x_mean, x_log_std, x_t
+
+        def get_mean_and_log_std(x, min_log_std = -20., max_log_std = 2.):
+            x_mean, x_log_std = jnp.split(x, 2, axis=-1)
+            x_log_std = jnp.clip(x_log_std, min_log_std, max_log_std)
+            return x_mean, x_log_std
+
+        ###################### keys ###################### 
+
+        key, subkey = jax.random.split(key)
         
         ###################### encode ###################### 
         z_dist_params = self.encoder(ts, s_t, z_t, a_t, y_t, rtg_t, horizon)
-
-        z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
-        min_log_std = -20.
-        max_log_std = 2.
-        z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
+        z_mean, z_log_std = get_mean_and_log_std(z_dist_params)
         dist_z_post = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
-        z_t = dist_z_post.sample(seed=key)
+        z_t = dist_z_post.sample(seed=subkey)
 
-        ###################### decoder ###################### 
+        ###################### action decoder ###################### 
+
+        a_shape = a_t.shape
 
         # use teacher forcing
         a_dist_params = self.decoder(ts, s_t, z_t, a_t, y_t, rtg_t, horizon)
-
-        a_mean, a_log_std = jnp.split(a_dist_params, 2, axis=-1)
-        min_log_std = -20.
-        max_log_std = 2.
-        a_log_std = jnp.clip(a_log_std, min_log_std, max_log_std)
-        a_mean = a_mean.reshape(-1, self.act_dim)
-        a_log_std = a_log_std.reshape(-1, self.act_dim)
+        a_mean, a_log_std = get_mean_and_log_std(a_dist_params)
         
+        # reshape
+        valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
+        a_mean, a_log_std, a_t = reshape_variables(a_mean,
+                                                   a_log_std,
+                                                   a_t,
+                                                   self.act_dim)
+
+        key, action_key, dynamics_key = jax.random.split(key, 3)
+        action_keys = jax.random.split(action_key, valid_mask.shape[0])
+        clipped_a_t = jnp.clip(a_t, -1+1e-6, 1-1e-6)
+        # a_log_probs, a_samp = partial(batch_get_log_prob, tanh=True)(valid_mask, a_mean, a_log_std, clipped_a_t, action_keys)
+        a_log_probs, a_samp = batch_get_log_prob(valid_mask, a_mean, a_log_std, clipped_a_t, action_keys)
+
+        ###################### dynamics ###################### 
+
+        y_shape = y_t.shape
+
+        # predict future states
+        # actions = a_samp.reshape(a_shape)
+        actions = jnp.tanh(a_mean).reshape(a_shape)
+
+        # sample a state sequence autoregressively from the learned markov dynamics model
+        def peform_rollout(state, key, actions):
+            
+            def step_fn(carry, action):
+                state, key = carry
+                key, dropout_key, sample_key = jax.random.split(key, 3)
+                s_dist_params = dynamics_apply(dynamics_params, state, action, rngs={'dropout_key': dropout_key})
+                s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
+                s_dist = tfd.MultivariateNormalDiag(loc=s_mean, scale_diag=jnp.exp(s_log_std))
+                next_state = s_dist.sample(seed=sample_key)
+                carry = next_state, key
+                return carry, s_dist_params
+
+            carry = state, key
+            _, s_dist_params = jax.lax.scan(step_fn, carry, actions)
+            
+            return s_dist_params
+        
+        batch_peform_rollout = jax.vmap(peform_rollout)
+
+        dynamics_keys = jax.random.split(dynamics_key, actions.shape[0])
+        s_dist_params = batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions)
+
+        # readout controlled variable(s)
+        if y_shape[1] == 1:
+            y_p = jnp.squeeze(jnp.take_along_axis(s_dist_params, horizon[..., None]-1, axis=1), axis=1)
+        else:
+            y_p = s_dist_params.copy()
+
+        y_mean, y_log_std = get_mean_and_log_std(y_p)
+        
+        # reshape
+        y_mean, y_log_std, y_t = reshape_variables(y_mean[...,self.controlled_variables], 
+                                                   y_log_std[...,self.controlled_variables],
+                                                   y_t,
+                                                   self.controlled_variables_dim)
+
+        if y_shape[1] == 1:
+            y_log_probs, _ = true_fn(y_mean, y_log_std, y_t)
+        else:
+            y_log_probs, _ = batch_get_log_prob(valid_mask, y_mean, y_log_std, y_t)
+
         ###################### loss ###################### 
 
-        def true_fn(a_mean, a_log_std, a_t):
-            base_dist = tfd.MultivariateNormalDiag(loc=a_mean, scale_diag=jnp.exp(a_log_std))
-            a_dist = tfd.TransformedDistribution(distribution=base_dist, bijector=tfb.Tanh())
-            return a_dist.log_prob(a_t)
-
-        def false_fn(a_mean, a_log_std, a_t):
-            return 0.
-        
-        def get_log_prob(mask, a_mean, a_log_std, a_t):
-            log_prob = jax.lax.cond(mask, true_fn, false_fn, a_mean, a_log_std, a_t)
-            return log_prob
-        batch_get_log_prob = jax.vmap(get_log_prob)
-        
-        a_t = a_t.reshape(-1, self.act_dim)
-        a_t = jnp.clip(a_t, -1+1e-6, 1-1e-6)
-        valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
-        log_probs = batch_get_log_prob(valid_mask, a_mean, a_log_std, a_t)
-        decoder_loss = jnp.sum(-log_probs * valid_mask) / jnp.sum(valid_mask)
-        
-        # independent standard normal prior
+        # standard normal prior
         dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_mean.shape), scale_diag=jnp.ones(z_log_std.shape))
         kl_loss = tfd.kl_divergence(dist_z_post, dist_z_prior).mean()
 
-        decoder_loss /= self.act_dim
-        kl_loss /= self.act_dim
+        a_decoder_loss = jnp.sum(-a_log_probs * valid_mask) / jnp.sum(valid_mask)
 
-        return decoder_loss, kl_loss
+        if y_shape[1] == 1:
+            y_decoder_loss = -y_log_probs.mean()
+        else:
+            y_decoder_loss = jnp.sum(-y_log_probs * valid_mask) / jnp.sum(valid_mask)
+
+        # normalize
+        kl_loss /= self.act_dim
+        a_decoder_loss /= self.act_dim
+        y_decoder_loss /= self.act_dim
+
+        return kl_loss, a_decoder_loss, y_decoder_loss
     
 class empowerment(linen.Module):
     state_dim: int

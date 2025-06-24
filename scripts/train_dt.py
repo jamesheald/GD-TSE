@@ -1,3 +1,6 @@
+import os
+os.environ["MUJOCO_GL"] = "egl"
+
 import argparse
 import csv
 import flax
@@ -15,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from datetime import datetime
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List
 
 from functools import partial
 
@@ -23,10 +26,14 @@ import wandb
 import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
 
-from decision_transformer.dt.model import make_transformer_networks, VAE, empowerment, Transformer
+from decision_transformer.dt.model import make_transformer_networks, VAE, empowerment, Transformer, dynamics
 from decision_transformer.dt.utils import ReplayBuffer, TrainingState, Transition
 from decision_transformer.dt.utils import discount_cumsum, save_params, load_params
 from decision_transformer.pmap import bcast_local_devices, synchronize_hosts, is_replicated
+
+import minari
+import imageio
+from matplotlib import pyplot as plt
 
 import jax
 print(jax.devices())
@@ -36,6 +43,9 @@ config.update('jax_debug_nans', True)
 config.update('jax_enable_x64', False)
 
 def train(args):
+
+    controlled_variables_dim = 6
+    controlled_variables = [30 + i for i in range(controlled_variables_dim)]
 
     dataset = args.dataset          # medium / medium-replay / medium-expert
     rtg_scale = args.rtg_scale      # normalize returns to go
@@ -102,11 +112,11 @@ def train(args):
     embed_dim = args.embed_dim          # embedding (hidden) dim of transformer
     n_heads = args.n_heads              # num of transformer heads
     dropout_p = args.dropout_p          # dropout probability
-    dynamics_dropout_p = args.dynamics_dropout_p
 
     # load data from this file
     env_d4rl_name = 'relocate-expert-v1'
-    dataset_path = f'{args.dataset_dir}/{env_d4rl_name}-qpos.pkl'
+    # dataset_path = f'{args.dataset_dir}/{env_d4rl_name}-qpos.pkl'
+    dataset_path = f'{args.dataset_dir}/{env_d4rl_name}-fullnextstate.pkl'
     # saves model and csv in this directory
     log_dir = args.log_dir
     if not os.path.exists(log_dir):
@@ -153,17 +163,15 @@ def train(args):
     max_epi_len = -1
     min_epi_len = 10**6
     state_stats = []
-    next_controlled_variables_stats = []
     for traj in trajectories:
         traj_len = traj['observations'].shape[0]
         min_epi_len = min(min_epi_len, traj_len)
         max_epi_len = max(max_epi_len, traj_len)
         state_stats.append(traj['observations'])
-        next_controlled_variables_stats.append(traj['next_controlled_variables'])
         # convert
         traj['actions'] = jnp.array(traj['actions'])
         traj['observations'] = jnp.array(traj['observations'])
-        traj['next_controlled_variables'] = jnp.array(traj['next_controlled_variables'])
+        traj['next_observations'] = jnp.array(traj['next_observations'])
         # calculate returns to go and rescale them
         traj['returns_to_go'] = jnp.array(discount_cumsum(traj['rewards'], 1.0) / rtg_scale).reshape(-1, 1)
         traj['timesteps'] = jnp.arange(start=0, stop=traj_len, step=1, dtype=jnp.int32).reshape(-1, 1)
@@ -173,15 +181,9 @@ def train(args):
     state_stats = jnp.concatenate(state_stats, axis=0)
     state_mean, state_std = jnp.mean(state_stats, axis=0), jnp.std(state_stats, axis=0) + 1e-8
 
-    next_controlled_variables_stats = jnp.concatenate(next_controlled_variables_stats, axis=0)
-    controlled_variables_mean, controlled_variables_std = jnp.mean(next_controlled_variables_stats, axis=0), jnp.std(next_controlled_variables_stats, axis=0) + 1e-6
-    controlled_variables_dim = next_controlled_variables_stats.shape[-1]
-
-    # state_dim = env.observation_space.shape[0]
-    # act_dim = env.action_space.shape[0]
     state_dim = trajectories[0]['observations'].shape[1]
     act_dim = trajectories[0]['actions'].shape[1]
-    trans_dim = state_dim + act_dim + controlled_variables_dim + 1 + 1 + 1  # rtg, timesteps, mask
+    trans_dim = state_dim + act_dim + state_dim + 1 + 1 + 1  # rtg, timesteps, mask
 
     # apply padding
     replay_buffer_data = []
@@ -189,27 +191,100 @@ def train(args):
         traj_len = traj['observations'].shape[0]
         padding_len = (max_epi_len + context_len) - traj_len
         states = traj['observations']
-        next_controlled_variables = traj['next_controlled_variables']
+        next_states = traj['next_observations']
 
         # apply input normalization
         if not args.rm_normalization:
             states = (states - state_mean) / state_std
-            next_controlled_variables = (next_controlled_variables - controlled_variables_mean) / controlled_variables_std
+            next_states = (next_states - state_mean) / state_std
 
         states = jnp.concatenate([states, jnp.zeros((padding_len, state_dim))], axis=0)
         actions = jnp.concatenate([traj['actions'], jnp.zeros((padding_len, act_dim))], axis=0)
-        next_controlled_variables = jnp.concatenate([next_controlled_variables, jnp.zeros((padding_len, controlled_variables_dim))], axis=0)
+        next_states = jnp.concatenate([next_states, jnp.zeros((padding_len, state_dim))], axis=0)
         returns_to_go = jnp.concatenate([traj['returns_to_go'], jnp.zeros((padding_len, 1))], axis=0)
         timesteps = jnp.concatenate([traj['timesteps'], jnp.zeros((padding_len, 1))], axis=0)
         traj_mask = jnp.concatenate([traj['traj_mask'], jnp.zeros((padding_len, 1))], axis=0)
 
-        padding_data = jnp.concatenate([states, actions, next_controlled_variables, returns_to_go, timesteps, traj_mask], axis=-1)
+        padding_data = jnp.concatenate([states, actions, next_states, returns_to_go, timesteps, traj_mask], axis=-1)
         assert trans_dim == padding_data.shape[-1], padding_data.shape
         replay_buffer_data.append(padding_data)
 
     replay_buffer = ReplayBuffer(
         data=jnp.concatenate(replay_buffer_data, axis=0).reshape(local_devices_to_use, -1, max_epi_len + context_len, trans_dim)
     ) # (local_devices_to_use, num_epi, max_epi_len + context_len, trans_dim)
+
+    ###################################### evaluation ###################################### 
+
+    minari_dataset = minari.load_dataset('D4RL/relocate/expert-v2')
+    minari_env = minari_dataset.recover_environment(render_mode='rgb_array')
+
+    def normalize_obs(obs):
+        norm_obs = (obs - state_mean) / state_std
+        return norm_obs
+
+    batch_size = 1
+    eval_dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
+    if args.trajectory_version:
+        eval_dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+    else:
+        eval_dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
+    eval_dummy_rtg = jnp.zeros((batch_size, context_len, 1))
+
+    dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros((1,6)), scale_diag=jnp.ones((1,6)))
+
+    eval_precoder = Transformer(state_dim=state_dim,
+                        act_dim=act_dim,
+                        controlled_variables_dim=controlled_variables_dim,
+                        n_blocks=n_blocks,
+                        h_dim=embed_dim,
+                        context_len=context_len,
+                        n_heads=n_heads,
+                        drop_p=dropout_p,
+                        transformer_type='action_decoder')
+    
+    def eval_vae(model, iter): # for model in ['vae', 'emp']:
+
+        if model == 'vae':
+            model_params = {'params': _vae_params['params']['decoder']}
+        elif model == 'emp':
+            model_params = {'params': _emp_params['params']['precoder']}
+
+        actions = jnp.zeros((batch_size, context_len, act_dim))
+        minari_env.reset()
+        # s_t = replay_buffer.data[0,:1,:1,:state_dim]
+        s_t = jnp.concatenate((minari_env.unwrapped.get_env_state()['qpos'], minari_env.unwrapped.get_env_state()['qpos']))[None, None, :]
+        key = jax.random.PRNGKey(seed)
+        for t in range(context_len):
+            sample_key, dropout_key, key = jax.random.split(key, 3)
+            z_t = dist_z_prior.sample(seed=sample_key)
+            a_dist_params = eval_precoder.apply(model_params,
+                                    eval_dummy_timesteps,
+                                    normalize_obs(s_t),
+                                    # s_t,
+                                    z_t,
+                                    actions,
+                                    eval_dummy_controlled_variables,
+                                    eval_dummy_rtg,
+                                    (jnp.ones((1,1))*context_len).astype(jnp.int32),
+                                    rngs={'dropout': dropout_key})
+            a_mean, _ = jnp.split(a_dist_params, 2, axis=-1)
+            actions = actions.at[:,t,:].set(jnp.tanh(a_mean[:,t,:]))
+
+        frames = []
+        # open loop control
+        for t in range(context_len):
+            frames.append(minari_env.render())
+            obs, rew, terminated, truncated, info = minari_env.step(actions[0,t,:])
+
+        imageio.mimsave('output_video' + model + '_' + str(iter) + '.mp4', frames, fps=30)
+
+        plt.figure()
+        for i in range(actions.shape[-1]):
+            plt.plot(actions[0,:,i])
+        plt.savefig('actissn_' + model + '_' + str(iter) + '.png')
+        plt.close()
+
+        return None
 
     ###################################### dynamics training ###################################### 
 
@@ -218,17 +293,10 @@ def train(args):
     # load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
     # _dynamics_params = load_params(load_current_model_path)
 
-    dynamics_model = make_transformer_networks(
+    dynamics_model = dynamics(
+        h_dims_dynamics=args.h_dims_dynamics,
         state_dim=state_dim,
-        act_dim=act_dim,
-        controlled_variables_dim=controlled_variables_dim,
-        n_blocks=n_blocks,
-        h_dim=embed_dim,
-        context_len=context_len,
-        n_heads=n_heads,
-        drop_p=dynamics_dropout_p,
-        trajectory_version=args.trajectory_version,
-        transformer_type='dynamics'
+        drop_out_rates=args.dynamics_dropout_rates
     )
 
     schedule_fn = optax.polynomial_schedule(
@@ -242,8 +310,12 @@ def train(args):
         optax.clip(args.gradient_clipping),
         optax.adamw(learning_rate=schedule_fn, weight_decay=wt_decay),
     )
+
+    batch_size = 1
+    dummy_states = jnp.zeros((batch_size, state_dim))
+    dummy_actions = jnp.zeros((batch_size, act_dim))
     key_params, key_dropout = jax.random.split(global_key)
-    dynamics_params = dynamics_model.init({'params': key_params, 'dropout': key_dropout})
+    dynamics_params = dynamics_model.init({'params': key_params, 'dropout': key_dropout}, dummy_states, dummy_actions)
     dynamics_optimizer_state = dynamics_optimizer.init(dynamics_params)
 
     # count the number of parameters
@@ -255,52 +327,20 @@ def train(args):
 
     def dynamics_loss(dynamics_params: Any,
                    transitions: Transition, key: jnp.ndarray) -> jnp.ndarray:
-        ts = transitions.ts.reshape(transitions.ts.shape[:2]).astype(jnp.int32)  # (batch_size_per_device, context_len)
         s_t = transitions.s_t  # (batch_size_per_device, context_len, state_dim)
         a_t = transitions.a_t  # (batch_size_per_device, context_len, action_dim)
-        rtg_t = transitions.rtg_t  # (batch_size_per_device, context_len, 1)
-        mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
-        
-        horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
-        if args.trajectory_version:
-            y_t = transitions.y_t  # (batch_size_per_device, context_len, controlled_variables_dim)
-            dummy_z_t = jnp.zeros((batch_size, context_len * controlled_variables_dim))
-        else:
-            def slice_fn(y_t_b, start_t):
-                return jax.lax.dynamic_slice(y_t_b, (start_t, 0), (1, controlled_variables_dim))  # (1, D)
-            start_ts = (horizon - 1).squeeze(-1)  # shape: (B,)
-            y_t = jax.vmap(slice_fn)(transitions.y_t, start_ts)  # (B, 1, D) y_t = transitions.y_t[:,horizon-1:horizon,:]
-            dummy_z_t = jnp.zeros((batch_size, controlled_variables_dim))
+        s_tp1 = transitions.s_tp1  # (batch_size_per_device, context_len, state_dim)
 
-        y_p = dynamics_model.apply(dynamics_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, rngs={'dropout': key})
-
-        def true_fn(y_mean, y_log_std, y_t):
-            dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
-            return dist.log_prob(y_t)
-
-        def false_fn(y_mean, y_log_std, y_t):
-            return 0.
-        
-        def get_log_prob(mask, y_mean, y_log_std, y_t):
-            log_prob = jax.lax.cond(mask, true_fn, false_fn, y_mean, y_log_std, y_t)
-            return log_prob
-        batch_get_log_prob = jax.vmap(get_log_prob)
-
-        y_mean, y_log_std = jnp.split(y_p, 2, axis=-1)
+        s_p = dynamics_model.apply(dynamics_params, s_t, a_t, rngs={'dropout': key})
+        s_mean, s_log_std = jnp.split(s_p, 2, axis=-1)
         min_log_std = -20.
         max_log_std = 2.
-        y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
-        y_mean = y_mean.reshape(-1, controlled_variables_dim)
-        y_log_std = y_log_std.reshape(-1, controlled_variables_dim)
-        y_t = y_t.reshape(-1, controlled_variables_dim)
-        
-        if args.trajectory_version:
-            valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
-            log_probs = batch_get_log_prob(valid_mask, y_mean, y_log_std, y_t)
-            loss = jnp.sum(-log_probs * valid_mask) / jnp.sum(valid_mask)
-        else:
-            log_probs = jax.vmap(true_fn)(y_mean, y_log_std, y_t)
-            loss = jnp.mean(-log_probs)
+        s_log_std = jnp.clip(s_log_std, min_log_std, max_log_std)
+
+        dist = tfd.MultivariateNormalDiag(loc=s_mean, scale_diag=jnp.exp(s_log_std))
+        log_probs = dist.log_prob(s_tp1)
+        loss = jnp.mean(-log_probs)
+        loss /= state_dim 
 
         return loss
 
@@ -312,12 +352,12 @@ def train(args):
         transitions: jnp.ndarray,
     ) -> Tuple[TrainingState, bool, Dict[str, jnp.ndarray]]:
 
-        cumsum_dims = np.cumsum([state_dim, act_dim, controlled_variables_dim, 1, 1, 1])
+        cumsum_dims = np.cumsum([state_dim, act_dim, state_dim, 1, 1, 1])
 
         transitions = Transition(
             s_t=transitions[:, :, :cumsum_dims[0]],
             a_t=transitions[:, :, cumsum_dims[0]:cumsum_dims[1]],
-            y_t=transitions[:, :, cumsum_dims[1]:cumsum_dims[2]],
+            s_tp1=transitions[:, :, cumsum_dims[1]:cumsum_dims[2]],
             rtg_t=transitions[:, :, cumsum_dims[2]:cumsum_dims[3]],
             ts=transitions[:, :, cumsum_dims[3]:cumsum_dims[4]],
             mask_t=transitions[:, :, cumsum_dims[4]:cumsum_dims[5]]
@@ -461,9 +501,12 @@ def train(args):
 
     ###################################### vae training ###################################### 
 
+    # _dynamics_params = jax.tree_util.tree_map(lambda x: x[0], dynamics_params)
+
     vae_model = VAE(
         state_dim=state_dim,
         act_dim=act_dim,
+        controlled_variables=controlled_variables,
         controlled_variables_dim=controlled_variables_dim,
         n_blocks=n_blocks,
         h_dim=embed_dim,
@@ -531,20 +574,17 @@ def train(args):
         
         horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
         if args.trajectory_version:
-            y_t = transitions.y_t  # (batch_size_per_device, context_len, controlled_variables_dim)
+            y_t = transitions.s_tp1[:,:controlled_variables]  # (batch_size_per_device, context_len, controlled_variables_dim)
             dummy_z_t = jnp.zeros((batch_size, context_len * controlled_variables_dim))
         else:
-            def slice_fn(y_t_b, start_t):
-                return jax.lax.dynamic_slice(y_t_b, (start_t, 0), (1, controlled_variables_dim))  # (1, D)
-            start_ts = (horizon - 1).squeeze(-1)  # shape: (B,)
-            y_t = jax.vmap(slice_fn)(transitions.y_t, start_ts)  # (B, 1, D) y_t = transitions.y_t[:,horizon-1:horizon,:]
+            y_t = jnp.take_along_axis(transitions.s_tp1, (horizon - 1)[..., None], axis=1)[...,controlled_variables] # (B, 1, D)
             dummy_z_t = jnp.zeros((batch_size, controlled_variables_dim))
 
         vae_key, dropout_key = jax.random.split(key, 2)
 
-        decoder_loss, kl_loss = vae_model.apply(vae_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, vae_key, rngs={'dropout': dropout_key})
+        kl_loss, action_decoder_loss, controlled_variable_decoder_loss = vae_model.apply(vae_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, vae_key, rngs={'dropout': dropout_key})
 
-        return decoder_loss + kl_loss, (decoder_loss, kl_loss)
+        return kl_loss + action_decoder_loss + controlled_variable_decoder_loss, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss)
 
     vae_grad = jax.jit(jax.value_and_grad(vae_loss, has_aux=True))
 
@@ -554,12 +594,12 @@ def train(args):
         transitions: jnp.ndarray,
     ) -> Tuple[TrainingState, bool, Dict[str, jnp.ndarray]]:
 
-        cumsum_dims = np.cumsum([state_dim, act_dim, controlled_variables_dim, 1, 1, 1])
+        cumsum_dims = np.cumsum([state_dim, act_dim, state_dim, 1, 1, 1])
 
         transitions = Transition(
             s_t=transitions[:, :, :cumsum_dims[0]],
             a_t=transitions[:, :, cumsum_dims[0]:cumsum_dims[1]],
-            y_t=transitions[:, :, cumsum_dims[1]:cumsum_dims[2]],
+            s_tp1=transitions[:, :, cumsum_dims[1]:cumsum_dims[2]],
             rtg_t=transitions[:, :, cumsum_dims[2]:cumsum_dims[3]],
             ts=transitions[:, :, cumsum_dims[3]:cumsum_dims[4]],
             mask_t=transitions[:, :, cumsum_dims[4]:cumsum_dims[5]]
@@ -567,15 +607,16 @@ def train(args):
 
         key, key_vae = jax.random.split(state.key, 2)
 
-        (loss, (decoder_loss, kl_loss)), vae_grads = vae_grad(state.params, transitions, key_vae)
+        (loss, (kl_loss, a_decoder_loss, y_decoder_loss)), vae_grads = vae_grad(state.params, transitions, key_vae)
         vae_grads = jax.lax.pmean(vae_grads, axis_name='i')
         vae_params_update, vae_optimizer_state = vae_optimizer.update(
             vae_grads, state.optimizer_state, state.params)
         vae_params = optax.apply_updates(state.params, vae_params_update)
 
         metrics = {'loss': loss,
-                   'decoder_loss': decoder_loss,
-                   'kl_loss': kl_loss}
+                   'kl_loss': kl_loss,
+                   'a_decoder_loss': a_decoder_loss,
+                   'y_decoder_loss': y_decoder_loss}
 
         new_state = TrainingState(
             optimizer_state=vae_optimizer_state,
@@ -602,31 +643,22 @@ def train(args):
         return training_state, replay_buffer, metrics, synchro
     
     run_training_vae = jax.pmap(partial(run_training_vae, max_epi_len=max_epi_len), axis_name='i')
-    # run_training_vae = partial(run_training_vae, max_epi_len=max_epi_len)
 
     vae_training_state = TrainingState(
         optimizer_state=vae_optimizer_state,
         params=vae_params,
         key=jnp.stack(jax.random.split(local_key, local_devices_to_use)),
-        # key=local_key,
         steps=jnp.zeros((local_devices_to_use,)))
-        # steps=jnp.zeros(1))
 
     total_updates = 0
-
-    # wandb.init(
-    #         name=f'{env_d4rl_name}-{random.randint(int(1e5), int(1e6) - 1)}',
-    #         group=env_d4rl_name,
-    #         project='jax_dt',
-    #         config=args
-    #     )
 
     save_model_path = os.path.join(log_dir, "vae_model.pt")
 
     for i_train_iter in range(max_train_iters):
         log_vae_losses = []
-        log_decoder_losses = []
         log_kl_losses = []
+        log_a_decoder_losses = []
+        log_y_decoder_losses = []
 
         # optimization
         vae_training_state, replay_buffer, training_metrics, synchro = run_training_vae(
@@ -634,12 +666,14 @@ def train(args):
         assert synchro[0], (current_step, vae_training_state)
         jax.tree_util.tree_map(lambda x: x.block_until_ready(), training_metrics)
         log_vae_losses.append(training_metrics['loss'])
-        log_decoder_losses.append(training_metrics['decoder_loss'])
         log_kl_losses.append(training_metrics['kl_loss'])
+        log_a_decoder_losses.append(training_metrics['a_decoder_loss'])
+        log_y_decoder_losses.append(training_metrics['y_decoder_loss'])
 
         mean_vae_loss = np.mean(log_vae_losses)
-        mean_decoder_loss = np.mean(log_decoder_losses)
         mean_kl_loss = np.mean(log_kl_losses)
+        mean_a_decoder_loss = np.mean(log_a_decoder_losses)
+        mean_y_decoder_loss = np.mean(log_y_decoder_losses)
         time_elapsed = str(datetime.now().replace(microsecond=0) - start_time)
 
         total_updates += num_updates_per_iter
@@ -649,22 +683,25 @@ def train(args):
                    "train iter: " + str(i_train_iter)  + '\n' +
                    "num of updates: " + str(total_updates) + '\n' +
                    "vae loss: " +  format(mean_vae_loss, ".5f") + '\n' +
-                   "decoder loss: " +  format(mean_decoder_loss, ".5f") + '\n' + 
-                   "kl loss: " +  format(mean_kl_loss, ".5f") + '\n'
+                   "kl loss: " +  format(mean_kl_loss, ".5f") + '\n' +
+                   "a decoder loss: " +  format(mean_a_decoder_loss, ".5f") + '\n' + 
+                   "y decoder loss: " +  format(mean_y_decoder_loss, ".5f") + '\n'
                 )
 
         print(log_str)
 
         wandb.log({'mean_vae_loss': mean_vae_loss,
-                   'mean_decoder_loss': mean_decoder_loss,
-                   'mean_kl_loss': mean_kl_loss})
+                   'mean_kl_loss': mean_kl_loss,
+                   'mean_a_decoder_loss': mean_a_decoder_loss,
+                   'mean_y_decoder_loss': mean_y_decoder_loss})
 
         log_data = [
             time_elapsed,
             total_updates,
             mean_vae_loss,
-            mean_decoder_loss,
-            mean_kl_loss
+            mean_kl_loss,
+            mean_a_decoder_loss,
+            mean_y_decoder_loss
         ]
 
         csv_writer.writerow(log_data)
@@ -676,6 +713,7 @@ def train(args):
             save_current_model_path = save_model_path[:-3] + f"_{total_updates}.pt"
             print("saving current model at: " + save_current_model_path)
             save_params(save_current_model_path, _vae_params)
+            eval_vae('vae', total_updates) # for model in ['vae', 'emp']:
 
     synchronize_hosts()
     
@@ -744,13 +782,11 @@ def train(args):
                                 dynamics_params=_dynamics_params,
                                 key=key_params)
 
-    load_model_path = os.path.join(log_dir, "vae_model.pt")
-    load_current_model_path = load_model_path[:-3] + f"_{max_train_iters*args.vae_save_iters}.pt"
-    _vae_params = load_params(load_current_model_path)
-    # emp_params['params']['precoder'] = _vae_params['params']['precoder']
-    # emp_params['params']['encoder'] = _vae_params['params']['encoder']
+    # load_model_path = os.path.join(log_dir, "vae_model.pt")
+    # load_current_model_path = load_model_path[:-3] + f"_{max_train_iters*args.vae_save_iters}.pt"
+    # _vae_params = load_params(load_current_model_path)
     emp_params['params']['precoder'] = _vae_params['params']['decoder']
-    del _vae_params
+    # del _vae_params
     
     emp_optimizer_state = emp_optimizer.init(emp_params)
 
@@ -910,83 +946,6 @@ def train(args):
     print("saved last updated model at: " + save_model_path)
     print("=" * 60)
 
-    ###################################### evaluation ###################################### 
-
-    import minari
-    dataset = minari.load_dataset('D4RL/relocate/expert-v2')
-    env = dataset.recover_environment(render_mode='rgb_array')
-
-    batch_size = 1
-    dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
-    dummy_states = jnp.zeros((batch_size, context_len, state_dim))
-    dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
-    if args.trajectory_version:
-        dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
-        dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
-    else:
-        dummy_latent = jnp.zeros((batch_size, controlled_variables_dim))
-        dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
-    dummy_rtg = jnp.zeros((batch_size, context_len, 1))
-    dummy_horizon= jnp.zeros((batch_size, 1), dtype=jnp.int32)
-    dummy_mask = jnp.zeros((batch_size, context_len, 1))
-
-    dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros((1,6)), scale_diag=jnp.ones((1,6)))
-
-    precoder = Transformer(state_dim=state_dim,
-                        act_dim=act_dim,
-                        controlled_variables_dim=controlled_variables_dim,
-                        n_blocks=n_blocks,
-                        h_dim=embed_dim,
-                        context_len=context_len,
-                        n_heads=n_heads,
-                        drop_p=dropout_p,
-                        transformer_type='action_decoder')
-    
-    def normalize_obs(obs):
-        norm_obs = (obs - state_mean) / state_std
-        return norm_obs
-
-    for model in ['vae', 'emp']:
-
-        if model == 'vae':
-            model_params = {'params': _vae_params['params']['decoder']}
-        elif model == 'emp':
-            model_params = {'params': _emp_params['params']['precoder']}
-        
-        actions = dummy_actions.copy()
-        env.reset()
-        # s_t = replay_buffer.data[0,:1,:1,:state_dim]
-        s_t = jnp.concatenate((env.unwrapped.get_env_state()['qpos'], env.unwrapped.get_env_state()['qpos']))[None, None, :]
-        key = jax.random.PRNGKey(seed)
-        for t in range(context_len):
-            sample_key, dropout_key, key = jax.random.split(key, 3)
-            z_t = dist_z_prior.sample(seed=sample_key)
-            a_dist_params = precoder.apply(model_params,
-                                    dummy_timesteps,
-                                    normalize_obs(s_t),
-                                    # s_t,
-                                    z_t,
-                                    actions,
-                                    dummy_controlled_variables,
-                                    dummy_rtg,
-                                    (jnp.ones((1,1))*context_len).astype(jnp.int32),
-                                    rngs={'dropout': dropout_key})
-            a_mean, _ = jnp.split(a_dist_params, 2, axis=-1)
-            actions = actions.at[:,t,:].set(jnp.tanh(a_mean[:,t,:]))
-
-        import imageio
-        frames = []
-        for t in range(context_len):
-            frames.append(env.render())
-            obs, rew, terminated, truncated, info = env.step(actions[0,t,:])
-
-        imageio.mimsave('output_video' + model + '.mp4', frames, fps=30)
-
-        from matplotlib import pyplot as plt
-        for i in range(actions.shape[-1]):
-            plt.plot(actions[0,:,i])
-        plt.savefig('action' + model + '.png')
-
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
@@ -1005,8 +964,10 @@ if __name__ == "__main__":
     parser.add_argument('--embed_dim', type=int, default=128)
     parser.add_argument('--n_heads', type=int, default=1)
     parser.add_argument('--dropout_p', type=float, default=0.1)
-    parser.add_argument('--dynamics_dropout_p', type=float, default=0.1)
     parser.add_argument('--gradient_clipping', type=float, default=0.25)
+    
+    parser.add_argument('--h_dims_dynamics', type=List, default=[256,256])
+    parser.add_argument('--dynamics_dropout_rates', type=List, default=[0., 0.])
 
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--grad_updates_per_step', type=int, default=1)
@@ -1014,11 +975,11 @@ if __name__ == "__main__":
     parser.add_argument('--wt_decay', type=float, default=1e-4)
     parser.add_argument('--warmup_steps', type=int, default=10000)
 
-    parser.add_argument('--max_train_iters', type=int, default=1_000)
+    parser.add_argument('--max_train_iters', type=int, default=5_000)
     parser.add_argument('--num_updates_per_iter', type=int, default=100)
-    parser.add_argument('--dynamics_save_iters', type=int, default=100)
-    parser.add_argument('--vae_save_iters', type=int, default=100)
-    parser.add_argument('--emp_save_iters', type=int, default=100)
+    parser.add_argument('--dynamics_save_iters', type=int, default=500)
+    parser.add_argument('--vae_save_iters', type=int, default=500)
+    parser.add_argument('--emp_save_iters', type=int, default=500)
     parser.add_argument('--rm_normalization', action='store_true', help='Turn off input normalization')
 
     parser.add_argument('--max_devices_per_host', type=int, default=None)
