@@ -29,13 +29,14 @@ class dynamics(linen.Module):
 
         self.dropout = [linen.Dropout(rate=layer_i_rate) for layer_i_rate in self.drop_out_rates] 
 
-    def __call__(self, obs, actions):
+    def __call__(self, obs, actions, key):
 
         x = jnp.concatenate((obs, actions), axis=-1)
         for i, fn in enumerate(self.dynamics):
             x = fn(x)
             if self.drop_out_rates[i] > 0.:
-                x = self.dropout[i](x, self.deterministic)
+                key, subkey = jax.random.split(key)
+                x = self.dropout[i](x, self.deterministic, subkey)
         x = self.dynamics_out(x)
 
         return x
@@ -54,14 +55,13 @@ class MaskedCausalAttention(linen.Module):
     dtype: Any = jnp.float32
     kernel_init: Callable[..., Any] = lecun_normal()
     bias_init: Callable[..., Any] = zeros
-    deterministic: bool = False if drop_p > 0.0 else True
     use_causal_mask: bool = True
 
     def setup(self):
         self.mask = jnp.tril(jnp.ones((self.max_T, self.max_T))).reshape(1, 1, self.max_T, self.max_T)
 
     @linen.compact
-    def __call__(self, src: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, src: jnp.ndarray, mask: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
         B, T, C = src.shape # batch size, seq length, h_dim * n_heads
         N, D = self.n_heads, C // self.n_heads # N = num heads, D = attention dim
         
@@ -96,7 +96,7 @@ class MaskedCausalAttention(linen.Module):
 
         attention = linen.Dropout(
             rate=self.drop_p,
-            deterministic=self.deterministic)(normalized_weights @ v)
+            deterministic=deterministic)(normalized_weights @ v)
         
         attention = attention.transpose(0, 2, 1, 3).reshape(B, T, N*D)
 
@@ -108,7 +108,7 @@ class MaskedCausalAttention(linen.Module):
 
         out = linen.Dropout(
             rate=self.drop_p,
-            deterministic=self.deterministic)(projection)
+            deterministic=deterministic)(projection)
 
         return out
 
@@ -121,19 +121,18 @@ class Block(linen.Module):
     dtype: Any = jnp.float32
     kernel_init: Callable[..., Any] = lecun_normal()
     bias_init: Callable[..., Any] = zeros
-    deterministic: bool = False if drop_p > 0.0 else True
     use_causal_mask: bool = True
 
     @linen.compact
-    def __call__(self, src: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, src: jnp.ndarray, mask: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
         # Attention -> LayerNorm -> MLP -> LayerNorm
         src = src + MaskedCausalAttention(
             h_dim=self.h_dim,
             max_T=self.max_T,
             n_heads=self.n_heads,
             drop_p=self.drop_p,
-            use_causal_mask=self.use_causal_mask,
-        )(src, mask) # residual
+            use_causal_mask=self.use_causal_mask
+        )(src, mask, deterministic) # residual
         src = linen.LayerNorm(dtype=self.dtype)(src)
 
         src2 = linen.Dense(
@@ -149,7 +148,7 @@ class Block(linen.Module):
             bias_init=self.bias_init)(src2)
         src2 = linen.Dropout(
             rate=self.drop_p,
-            deterministic=self.deterministic)(src2)
+            deterministic=deterministic)(src2)
 
         src = src + src2 # residual
         src = linen.LayerNorm(dtype=self.dtype)(src)
@@ -171,6 +170,7 @@ class Transformer(linen.Module):
     bias_init: Callable[..., Any] = zeros
     transformer_type: str = 'dynamics' # 'encoder', 'precoder' or 'dynamics'
     trajectory_version: bool = False
+    apply_conv: bool = False
 
     def setup(self):
         None
@@ -183,7 +183,8 @@ class Transformer(linen.Module):
                  actions: jnp.ndarray,
                  next_controlled_variables: jnp.ndarray,
                  returns_to_go: jnp.ndarray,
-                 horizon: jnp.ndarray) -> jnp.ndarray:
+                 horizon: jnp.ndarray,
+                 deterministic: bool) -> jnp.ndarray:
         B, T, _ = states.shape
 
         horizon_embeddings = linen.Embed(
@@ -327,7 +328,7 @@ class Transformer(linen.Module):
                 max_T=max_T,
                 n_heads=self.n_heads,
                 drop_p=self.drop_p,
-                use_causal_mask=False if (self.transformer_type == 'encoder' or self.transformer_type == 'vae_encoder') else True)(h, padded_mask)
+                use_causal_mask=False if (self.transformer_type == 'encoder' or self.transformer_type == 'vae_encoder') else True)(h, padded_mask, deterministic)
             
         if self.transformer_type == 'encoder' or self.transformer_type == 'vae_encoder':
             # Multiply to zero-out unmasked values
@@ -348,6 +349,9 @@ class Transformer(linen.Module):
             output_dim = self.act_dim
         elif self.transformer_type == 'action_decoder':
             h = h[:, 1:]
+            # smooth hidden representations
+            # if self.apply_conv:
+            #     h = linen.Conv(features=self.h_dim, kernel_size=7, padding="SAME")(h) # kernel_size=3,5,7
             output_dim = self.act_dim * 2
         elif self.transformer_type == 'dynamics':
             h = h[:, -next_controlled_variables.shape[1]:]
@@ -359,6 +363,12 @@ class Transformer(linen.Module):
             dtype=self.dtype,
             kernel_init=self.kernel_init,
             bias_init=self.bias_init)(h)
+        
+        # if self.transformer_type == 'action_decoder' and self.apply_conv:
+        #     x_mean, x_log_std = jnp.split(output, 2, axis=-1)
+        #     # smooth mean actions
+        #     x_mean = linen.Conv(features=self.act_dim, kernel_size=7, padding="SAME", feature_group_count=self.act_dim)(x_mean) # kernel_size=3,5,7
+        #     output = jnp.concatenate([x_mean, x_log_std], axis=-1)
 
         return output
 
@@ -430,7 +440,8 @@ def make_transformer_networks(state_dim: int,
                          actions: jnp.ndarray,
                          next_controlled_variables: jnp.ndarray,
                          returns_to_go: jnp.ndarray,
-                         horizon: jnp.ndarray):
+                         horizon: jnp.ndarray,
+                         deterministic):
                 outputs = make_transformer(
                     state_dim=state_dim,
                     act_dim=act_dim,
@@ -440,7 +451,7 @@ def make_transformer_networks(state_dim: int,
                     context_len=context_len,
                     n_heads=n_heads,
                     drop_p=drop_p,
-                    transformer_type=transformer_type)(timesteps, states, latent, actions, next_controlled_variables, returns_to_go, horizon)
+                    transformer_type=transformer_type)(timesteps, states, latent, actions, next_controlled_variables, returns_to_go, horizon, deterministic)
                 return outputs
 
         transformer_module = TransformerModule()
@@ -482,7 +493,8 @@ class VAE(linen.Module):
                                     context_len=self.context_len,
                                     n_heads=self.n_heads,
                                     drop_p=self.drop_p,
-                                    transformer_type='action_decoder')
+                                    transformer_type='action_decoder',
+                                    apply_conv=False)
 
     def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_apply, dynamics_params, key):
 
@@ -512,13 +524,19 @@ class VAE(linen.Module):
             x_mean, x_log_std = jnp.split(x, 2, axis=-1)
             x_log_std = jnp.clip(x_log_std, min_log_std, max_log_std)
             return x_mean, x_log_std
+        
+        def compute_smoothness(x: jnp.ndarray) -> jnp.ndarray:
+            # x: (B, T, D)
+            dx = x[:, 1:, :] - x[:, :-1, :]  # (B, T-1, D)
+            smoothness = jnp.mean(jnp.square(dx), axis=1)  # (B, D)
+            return smoothness
 
         ###################### keys ###################### 
 
         key, subkey = jax.random.split(key)
         
         ###################### encode ###################### 
-        z_dist_params = self.encoder(ts, s_t, z_t, a_t, y_t, rtg_t, horizon)
+        z_dist_params = self.encoder(ts, s_t, z_t, a_t, y_t, rtg_t, horizon, deterministic=False)
         z_mean, z_log_std = get_mean_and_log_std(z_dist_params)
         dist_z_post = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
         z_t = dist_z_post.sample(seed=subkey)
@@ -527,9 +545,17 @@ class VAE(linen.Module):
 
         a_shape = a_t.shape
 
-        # use teacher forcing
-        a_dist_params = self.decoder(ts, s_t, z_t, a_t, y_t, rtg_t, horizon)
+        # use teacher forcing - fast(er) training
+        a_dist_params = self.decoder(ts, s_t, z_t, a_t, y_t, rtg_t, horizon, deterministic=False)
         a_mean, a_log_std = get_mean_and_log_std(a_dist_params)
+
+        # # no teacher forcing - slow training
+        # actions = jnp.zeros(a_t.shape)
+        # for t in range(self.context_len):
+        #     a_dist_params = self.decoder(ts, s_t, z_t, actions, y_t, rtg_t, horizon)
+        #     a_mean, _ = jnp.split(a_dist_params, 2, axis=-1)
+        #     actions = actions.at[:,t,:].set(jnp.tanh(a_mean[:, t, :]))
+        # a_mean, a_log_std = get_mean_and_log_std(a_dist_params)
         
         # reshape
         valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
@@ -558,7 +584,7 @@ class VAE(linen.Module):
             def step_fn(carry, action):
                 state, key = carry
                 key, dropout_key, sample_key = jax.random.split(key, 3)
-                s_dist_params = dynamics_apply(dynamics_params, state, action, rngs={'dropout_key': dropout_key})
+                s_dist_params = dynamics_apply(dynamics_params, state, action, dropout_key)
                 s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
                 s_dist = tfd.MultivariateNormalDiag(loc=s_mean, scale_diag=jnp.exp(s_log_std))
                 next_state = s_dist.sample(seed=sample_key)
@@ -600,12 +626,16 @@ class VAE(linen.Module):
         dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_mean.shape), scale_diag=jnp.ones(z_log_std.shape))
         kl_loss = tfd.kl_divergence(dist_z_post, dist_z_prior).mean()
 
-        a_decoder_loss = jnp.sum(-a_log_probs * valid_mask) / jnp.sum(valid_mask)
+        # a_decoder_loss = jnp.sum(-a_log_probs * valid_mask) / jnp.sum(valid_mask)
+        a_decoder_loss = jnp.sum(-a_log_probs * valid_mask) / a_shape[0]
 
         if y_shape[1] == 1:
             y_decoder_loss = -y_log_probs.mean()
         else:
-            y_decoder_loss = jnp.sum(-y_log_probs * valid_mask) / jnp.sum(valid_mask)
+            # y_decoder_loss = jnp.sum(-y_log_probs * valid_mask) / jnp.sum(valid_mask)
+            y_decoder_loss = jnp.sum(-y_log_probs * valid_mask) / a_shape[0]
+
+        # smoothness = compute_smoothness(actions)
 
         # normalize
         kl_loss /= self.act_dim
