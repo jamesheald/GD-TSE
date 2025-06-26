@@ -531,7 +531,7 @@ def train(args):
 
     else:
 
-        total_updates = 500000
+        total_updates = 300000
         load_model_path = os.path.join(log_dir, "dynamics_model.pt")
         load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
         _dynamics_params = load_params(load_current_model_path)
@@ -635,6 +635,7 @@ def train(args):
         kl_loss, action_decoder_loss, controlled_variable_decoder_loss = vae_model.apply(vae_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, vae_key, rngs={'dropout': dropout_key})
 
         w = steps/(num_updates_per_iter*max_train_iters)
+        w = jnp.clip(1, 0., 1.)
 
         # return kl_loss + action_decoder_loss + controlled_variable_decoder_loss, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss)
         return kl_loss + action_decoder_loss * (1-w) + controlled_variable_decoder_loss * w, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss)
@@ -779,7 +780,7 @@ def train(args):
                    'mean_kl_loss': mean_kl_loss,
                    'mean_a_decoder_loss': mean_a_decoder_loss,
                    'mean_y_decoder_loss': mean_y_decoder_loss,
-                   'mean_weights': mean_weights})
+                   'mean_weight_(y_decoder)': mean_weights})
 
         log_data = [
             time_elapsed,
@@ -1060,7 +1061,7 @@ if __name__ == "__main__":
     parser.add_argument('--wt_decay', type=float, default=1e-4)
     parser.add_argument('--warmup_steps', type=int, default=10000)
 
-    parser.add_argument('--max_train_iters', type=int, default=3_000)
+    parser.add_argument('--max_train_iters', type=int, default=5_000)
     parser.add_argument('--num_updates_per_iter', type=int, default=100)
     parser.add_argument('--dynamics_save_iters', type=int, default=500)
     parser.add_argument('--vae_save_iters', type=int, default=500)
@@ -1070,7 +1071,7 @@ if __name__ == "__main__":
     parser.add_argument('--max_devices_per_host', type=int, default=None)
 
     parser.add_argument('--trajectory_version', type=bool, default=False)
-    parser.add_argument('--resume_start_time_str', type=str, default=None) # None, '25-06-25-16-17-25'
+    parser.add_argument('--resume_start_time_str', type=str, default='25-06-26-11-02-30') # None, '25-06-25-16-17-25'
 
     args = parser.parse_args()
 
