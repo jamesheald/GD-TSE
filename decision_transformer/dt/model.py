@@ -313,14 +313,13 @@ class Transformer(linen.Module):
             padded_mask = jnp.concatenate((jnp.ones((B,1)),
                                            arange[:,:next_controlled_variables.shape[1]] < horizon),
                                            axis=-1).astype(jnp.float32)[..., None]
-        if self.transformer_type == 'vae_encoder':
+        elif self.transformer_type == 'vae_encoder':
             padded_mask = jnp.concatenate((jnp.ones((B,1)),
                                            arange[:,:next_controlled_variables.shape[1]] < horizon,
                                            arange[:,:actions.shape[1]] < horizon),
                                            axis=-1).astype(jnp.float32)[..., None]
         else:
             padded_mask = jnp.zeros(1) # dummy
-        
         # transformer and prediction
         for _ in range(self.n_blocks):
             h = Block(
@@ -483,7 +482,8 @@ class VAE(linen.Module):
                                     context_len=self.context_len,
                                     n_heads=self.n_heads,
                                     drop_p=self.drop_p,
-                                    transformer_type='vae_encoder')
+                                    transformer_type='encoder')
+                                    # transformer_type='vae_encoder')
 
         self.decoder = Transformer(state_dim=self.state_dim,
                                     act_dim=self.act_dim,
@@ -587,7 +587,8 @@ class VAE(linen.Module):
                 s_dist_params = dynamics_apply(dynamics_params, state, action, dropout_key)
                 s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
                 s_dist = tfd.MultivariateNormalDiag(loc=s_mean, scale_diag=jnp.exp(s_log_std))
-                next_state = s_dist.sample(seed=sample_key)
+                delta_s = s_dist.sample(seed=sample_key)
+                next_state = state + delta_s
                 carry = next_state, key
                 return carry, s_dist_params
 
