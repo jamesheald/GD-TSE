@@ -605,13 +605,15 @@ class VAE(linen.Module):
         # readout controlled variable(s)
         if y_shape[1] == 1:
             s_p = jnp.squeeze(jnp.take_along_axis(s_dist_params, horizon[..., None]-1, axis=1), axis=1)
+            curr_s = jnp.squeeze(jnp.take_along_axis(s_t, horizon[..., None]-1, axis=1), axis=1)
         else:
             s_p = s_dist_params.copy()
+            curr_s = s_t.copy()
 
         delta_s, s_log_std = get_mean_and_log_std(s_p)
         
         # reshape
-        y_mean, y_log_std, y_t = reshape_variables((s_t+delta_s)[...,self.controlled_variables], # add delta_s to s_t to get s_tp1
+        y_mean, y_log_std, y_t = reshape_variables((curr_s+delta_s)[...,self.controlled_variables], # add delta_s to s_t to get s_tp1
                                                    s_log_std[...,self.controlled_variables],
                                                    y_t,
                                                    self.controlled_variables_dim)

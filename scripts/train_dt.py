@@ -635,7 +635,7 @@ def train(args):
         kl_loss, action_decoder_loss, controlled_variable_decoder_loss = vae_model.apply(vae_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, vae_key, rngs={'dropout': dropout_key})
 
         w = steps/(num_updates_per_iter*max_train_iters)
-        w = jnp.clip(1, 0., 1.)
+        w = jnp.clip(w, 0., 1.)
 
         # return kl_loss + action_decoder_loss + controlled_variable_decoder_loss, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss)
         return kl_loss + action_decoder_loss * (1-w) + controlled_variable_decoder_loss * w, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss)
