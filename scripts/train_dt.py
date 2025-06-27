@@ -238,15 +238,17 @@ def train(args):
                         context_len=context_len,
                         n_heads=n_heads,
                         drop_p=dropout_p,
-                        transformer_type='action_decoder',
+                        transformer_type='precoder',
                         apply_conv=False)
     
     def eval_vae(model, params, iter): # for model in ['vae', 'emp']:
 
-        if model == 'vae':
-            model_params = {'params': params['params']['decoder']} # params = _vae_params
-        elif model == 'emp':
-            model_params = {'params': params['params']['precoder']} # params = _emp_params
+        # if model == 'vae':
+            # model_params = {'params': params['params']['decoder']} # params = _vae_params
+        # elif model == 'emp':
+            # model_params = {'params': params['params']['precoder']} # params = _emp_params
+
+        model_params = {'params': params['params']['precoder']}
 
         def get_actions(minari_env):
 
@@ -281,7 +283,7 @@ def train(args):
             # autoregressively generate actions
             for t in range(context_len):
                 sample_key, dropout_key, key = jax.random.split(key, 3)
-                a_dist_params = jax.jit(eval_precoder.apply, static_argnames=('deterministic',))(model_params,
+                pre_tanh_a = jax.jit(eval_precoder.apply, static_argnames=('deterministic',))(model_params,
                                         eval_dummy_timesteps,
                                         normalize_obs(s_t),
                                         # s_t,
@@ -292,8 +294,7 @@ def train(args):
                                         (jnp.ones((1,1))*context_len).astype(jnp.int32),
                                         deterministic=True,
                                         rngs={'dropout': dropout_key})
-                a_mean, _ = jnp.split(a_dist_params, 2, axis=-1)
-                actions = actions.at[:,t,:].set(jnp.tanh(a_mean[:,t,:]))
+                actions = actions.at[:,t,:].set(jnp.tanh(pre_tanh_a[:,t,:]))
 
             return actions
             
@@ -562,46 +563,60 @@ def train(args):
         n_heads=n_heads,
         drop_p=dropout_p
     )
+    
+    if args.resume_start_time_str is None or args.resume_vae is False:
 
-    schedule_fn = optax.polynomial_schedule(
-        init_value=lr * 1 / warmup_steps,
-        end_value=lr,
-        power=1,
-        transition_steps=warmup_steps,
-        transition_begin=0
-    )
-    vae_optimizer = optax.chain(
-        optax.clip(args.gradient_clipping),
-        optax.adamw(learning_rate=schedule_fn, weight_decay=wt_decay),
-    )
+        schedule_fn = optax.polynomial_schedule(
+            init_value=lr * 1 / warmup_steps,
+            end_value=lr,
+            power=1,
+            transition_steps=warmup_steps,
+            transition_begin=0
+        )
+        vae_optimizer = optax.chain(
+            optax.clip(args.gradient_clipping),
+            optax.adamw(learning_rate=schedule_fn, weight_decay=wt_decay),
+        )
 
-    batch_size = 1
-    dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
-    dummy_states = jnp.zeros((batch_size, context_len, state_dim))
-    dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
-    if args.trajectory_version:
-        dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
-        dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+        batch_size = 1
+        dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
+        dummy_states = jnp.zeros((batch_size, context_len, state_dim))
+        dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
+        if args.trajectory_version:
+            dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
+            dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+        else:
+            dummy_latent = jnp.zeros((batch_size, controlled_variables_dim))
+            dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
+        dummy_rtg = jnp.zeros((batch_size, context_len, 1))
+        dummy_horizon= jnp.ones((batch_size, 1), dtype=jnp.int32)
+        dummy_mask = jnp.ones((batch_size, context_len, 1))
+
+        key_params, key_dropout = jax.random.split(global_key_vae)
+        vae_params = vae_model.init({'params': key_params, 'dropout': key_dropout},
+                                    ts=dummy_timesteps,
+                                    s_t=dummy_states,
+                                    z_t=dummy_latent,
+                                    a_t=dummy_actions,
+                                    y_t=dummy_controlled_variables,
+                                    rtg_t=dummy_rtg,
+                                    horizon=dummy_horizon,
+                                    mask=dummy_mask,
+                                    dynamics_apply=dynamics_model.apply,
+                                    dynamics_params=_dynamics_params,
+                                    key=key_params)
+    
     else:
-        dummy_latent = jnp.zeros((batch_size, controlled_variables_dim))
-        dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
-    dummy_rtg = jnp.zeros((batch_size, context_len, 1))
-    dummy_horizon= jnp.ones((batch_size, 1), dtype=jnp.int32)
-    dummy_mask = jnp.ones((batch_size, context_len, 1))
 
-    key_params, key_dropout = jax.random.split(global_key_vae)
-    vae_params = vae_model.init({'params': key_params, 'dropout': key_dropout},
-                                ts=dummy_timesteps,
-                                s_t=dummy_states,
-                                z_t=dummy_latent,
-                                a_t=dummy_actions,
-                                y_t=dummy_controlled_variables,
-                                rtg_t=dummy_rtg,
-                                horizon=dummy_horizon,
-                                mask=dummy_mask,
-                                dynamics_apply=dynamics_model.apply,
-                                dynamics_params=_dynamics_params,
-                                key=key_params)
+        vae_optimizer = optax.chain(
+            optax.clip(args.gradient_clipping),
+            optax.adamw(learning_rate=lr, weight_decay=wt_decay),
+        )
+
+        total_updates = 500000
+        load_model_path = os.path.join(log_dir, "vae_model.pt")
+        load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
+        vae_params = load_params(load_current_model_path)
     
     vae_optimizer_state = vae_optimizer.init(vae_params)
 
@@ -1064,13 +1079,16 @@ if __name__ == "__main__":
     parser.add_argument('--max_train_iters', type=int, default=5_000)
     parser.add_argument('--num_updates_per_iter', type=int, default=100)
     parser.add_argument('--dynamics_save_iters', type=int, default=500)
-    parser.add_argument('--vae_save_iters', type=int, default=500)
+    parser.add_argument('--vae_save_iters', type=int, default=75)
     parser.add_argument('--emp_save_iters', type=int, default=500)
     parser.add_argument('--rm_normalization', action='store_true', help='Turn off input normalization')
 
     parser.add_argument('--max_devices_per_host', type=int, default=None)
 
     parser.add_argument('--trajectory_version', type=bool, default=False)
+    
+    parser.add_argument('--resume_dynamics', action='store_true')
+    parser.add_argument('--resume_vae', action='store_true')
     parser.add_argument('--resume_start_time_str', type=str, default='25-06-26-11-02-30') # None, '25-06-25-16-17-25'
 
     args = parser.parse_args()
