@@ -16,6 +16,92 @@ tfb = tfp.bijectors
 
 from functools import partial
 
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+from typing import Any, Callable, Tuple
+
+class AutonomousGRU(nn.Module):
+    hidden_size: int
+    act_dim: int
+    context_len: int
+
+    @nn.compact
+    def __call__(self, s_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
+        # s_t: (batch, 1, state_dim) assumed
+        # z_t: (batch, z_dim)
+    
+        def scan_gru(s_t, z_t):
+            
+            # Initial input: (batch, state_dim + z_dim)
+            initial_input = jnp.concatenate([s_t[0, :], z_t], axis=-1)
+
+            # Map to initial hidden state
+            initial_carry = nn.Dense(self.hidden_size)(initial_input)
+
+            gru_cell = nn.GRUCell(features=self.hidden_size)
+
+            # Wrap the GRUCell with nn.RNN
+            # cell_size is typically the hidden state size of the cell
+            rnn_layer = nn.RNN(gru_cell)
+
+            # Apply the RNN layer to the inputs
+            inputs = jnp.zeros((self.context_len,1))
+            _, outputs = rnn_layer(inputs, initial_carry=initial_carry, return_carry=True)
+
+            ys = nn.Dense(self.act_dim)(outputs)
+            # ys = nn.Dense(self.act_dim)(jnp.concatenate((initial_input[None,:].repeat(outputs.shape[0], axis=0), outputs), axis=-1))
+            actions = jnp.tanh(ys)
+                
+            return actions  # (T, act_dim)
+
+        # Vectorize across batch
+        actions = jax.vmap(scan_gru)(s_t, z_t)  # (batch, T, act_dim)
+
+        return actions
+
+class MLP(linen.Module):
+    out_dim: int
+    h_dims: List
+    
+    def setup(self):
+
+        self.mlp = [linen.Sequential([linen.Dense(features=h_dim), linen.LayerNorm(), linen.relu]) for h_dim in self.h_dims]
+        self.mlp_out = linen.Dense(features=self.out_dim)
+
+    def __call__(self, x):
+
+        for fn in self.mlp:
+            x = fn(x)
+        x = self.mlp_out(x)
+
+        return x
+
+class MLP_precoder(linen.Module):
+    act_dim: int
+    context_len: int
+    h_dims: List
+    apply_conv: bool = False
+    
+    def setup(self):
+
+        self.precoder = [linen.Sequential([linen.Dense(features=h_dim), linen.LayerNorm(), linen.relu]) for h_dim in self.h_dims]
+        self.precoder_out = linen.Dense(features=self.context_len*self.act_dim)
+
+    def __call__(self, s_t, z_t):
+
+        x = jnp.concatenate((s_t[:,0,:], z_t), axis=-1)
+        for fn in self.precoder:
+            x = fn(x)
+        # if self.apply_conv:
+            # x = linen.Conv(features=self.h_dims[-1], kernel_size=7, padding="SAME")(h) # kernel_size=3,5,7
+        x = self.precoder_out(x).reshape(-1,self.context_len,self.act_dim)
+        if self.apply_conv:
+            x = linen.Conv(features=self.act_dim, kernel_size=7, padding="SAME", feature_group_count=self.act_dim)(x) # kernel_size=3,5,7
+        actions = jnp.tanh(x)
+
+        return actions
+
 class dynamics(linen.Module):
     h_dims_dynamics: List
     state_dim: int
@@ -471,32 +557,55 @@ class VAE(linen.Module):
     context_len: int
     n_heads: int
     drop_p: float
+    trajectory_version: bool = False
+    n_dynamics_ensembles: int = 1
 
     def setup(self):
 
-        self.encoder = Transformer(state_dim=self.state_dim,
-                                    act_dim=self.act_dim,
-                                    controlled_variables_dim=self.controlled_variables_dim,
-                                    n_blocks=self.n_blocks,
-                                    h_dim=self.h_dim,
-                                    context_len=self.context_len,
-                                    n_heads=self.n_heads,
-                                    drop_p=self.drop_p,
-                                    transformer_type='encoder')
-                                    # transformer_type='vae_encoder')
+        # self.encoder = Transformer(state_dim=self.state_dim,
+        #                             act_dim=self.act_dim,
+        #                             controlled_variables_dim=self.controlled_variables_dim,
+        #                             n_blocks=self.n_blocks,
+        #                             h_dim=self.h_dim,
+        #                             context_len=self.context_len,
+        #                             n_heads=self.n_heads,
+        #                             drop_p=self.drop_p,
+        #                             transformer_type='encoder')
+        #                             # transformer_type='vae_encoder')
 
-        self.precoder = Transformer(state_dim=self.state_dim,
-                                    act_dim=self.act_dim,
-                                    controlled_variables_dim=self.controlled_variables_dim,
-                                    n_blocks=self.n_blocks,
-                                    h_dim=self.h_dim,
-                                    context_len=self.context_len,
-                                    n_heads=self.n_heads,
-                                    drop_p=self.drop_p,
-                                    transformer_type='precoder',
-                                    apply_conv=False)
+        # if self.trajectory_version:
+        #     self.encoder = MLP(out_dim=self._context_len*self.controlled_variables_dim*2,
+        #                        h_dims=[256,256])
+        # else:
+        #     self.encoder = MLP(out_dim=self.controlled_variables_dim*2,
+        #                        h_dims=[256,256])
+            
+        self.encoder = MLP(out_dim=self.controlled_variables_dim*2,
+                           h_dims=[256,256])
 
-    def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_apply, dynamics_params, key):
+    # out_dim: int
+    # h_dims: List
+
+        # self.precoder = Transformer(state_dim=self.state_dim,
+        #                             act_dim=self.act_dim,
+        #                             controlled_variables_dim=self.controlled_variables_dim,
+        #                             n_blocks=self.n_blocks,
+        #                             h_dim=self.h_dim,
+        #                             context_len=self.context_len,
+        #                             n_heads=self.n_heads,
+        #                             drop_p=self.drop_p,
+        #                             transformer_type='precoder',
+        #                             apply_conv=False)
+        
+        # self.precoder = MLP_precoder(act_dim=self.act_dim,
+        #                              context_len=self.context_len,
+        #                              h_dims=[256,256])
+
+        self.precoder = AutonomousGRU(act_dim=self.act_dim,
+                                      context_len=self.context_len,
+                                      hidden_size=256)
+
+    def __call__(self, ts, s_t, z_t, a_t, s_tp1, rtg_t, horizon, mask, dynamics_apply, dynamics_params, key):
 
         def true_fn(x_mean, x_log_std, x_t, key=None):
             x_dist = tfd.MultivariateNormalDiag(loc=x_mean, scale_diag=jnp.exp(x_log_std))
@@ -531,12 +640,15 @@ class VAE(linen.Module):
             smoothness = jnp.mean(jnp.square(dx), axis=1)  # (B, D)
             return smoothness
 
+        y_t = jnp.squeeze(jnp.take_along_axis(s_tp1, horizon[..., None]-1, axis=1), axis=1)[...,self.controlled_variables]
+
         ###################### keys ###################### 
 
         key, subkey = jax.random.split(key)
         
         ###################### encode ###################### 
-        z_dist_params = self.encoder(ts, s_t, z_t, a_t, y_t, rtg_t, horizon, deterministic=False)
+        # z_dist_params = self.encoder(ts, s_t, z_t, a_t, y_t, rtg_t, horizon, deterministic=False)
+        z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_t], axis=-1))
         z_mean, z_log_std = get_mean_and_log_std(z_dist_params)
         dist_z_post = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
         z_t = dist_z_post.sample(seed=subkey)
@@ -546,8 +658,10 @@ class VAE(linen.Module):
         a_shape = a_t.shape
 
         # use teacher forcing - fast(er) training
-        pre_tanh_a = self.precoder(ts, s_t, z_t, a_t, y_t, rtg_t, horizon, deterministic=False)
-        actions = jnp.tanh(pre_tanh_a)
+        # pre_tanh_a = self.precoder(ts, s_t, z_t, a_t, y_t, rtg_t, horizon, deterministic=False)
+        # actions = jnp.tanh(pre_tanh_a)
+
+        actions = self.precoder(s_t, z_t)
 
         # # no teacher forcing - slow training
         # actions = jnp.zeros(a_t.shape)
@@ -559,7 +673,7 @@ class VAE(linen.Module):
 
         ###################### dynamics ###################### 
 
-        y_shape = y_t.shape
+        object_velocity = s_tp1[:,:,30:36]-s_t[:,:,30:36]
 
         # predict future states
         # sample a state sequence autoregressively from the learned markov dynamics model
@@ -568,45 +682,65 @@ class VAE(linen.Module):
             def step_fn(carry, action):
                 state, key = carry
                 key, dropout_key, sample_key = jax.random.split(key, 3)
-                s_dist_params = dynamics_apply(dynamics_params, state, action, dropout_key)
+                
+                # multiple samples
+                dropout_keys = jax.random.split(dropout_key, self.n_dynamics_ensembles)
+                s_dist_params = jax.vmap(dynamics_apply, in_axes=(None,None,None,0))(dynamics_params, state, action, dropout_keys)
                 s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
+                disagreement = jnp.var(s_mean, axis=0).mean()
+                s_mean = s_mean[0]
+                s_log_std = s_log_std[0]
+                s_dist_params = s_dist_params[0]
+
+                # # one sample
+                # s_dist_params = dynamics_apply(dynamics_params, state, action, dropout_key)
+                # s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
+                # disagreement = jnp.zeros(1)
+
                 s_dist = tfd.MultivariateNormalDiag(loc=s_mean, scale_diag=jnp.exp(s_log_std))
                 delta_s = s_dist.sample(seed=sample_key)
                 next_state = state + delta_s
                 carry = next_state, key
-                return carry, s_dist_params
+                return carry, (s_dist_params, disagreement)
 
             carry = state, key
-            _, s_dist_params = jax.lax.scan(step_fn, carry, actions)
+            _, (s_dist_params, disagreement) = jax.lax.scan(step_fn, carry, actions)
             
-            return s_dist_params
+            return s_dist_params, disagreement
         
         batch_peform_rollout = jax.vmap(peform_rollout)
 
         dynamics_keys = jax.random.split(key, actions.shape[0])
-        s_dist_params = batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions)
+        s_dist_params, disagreement = batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions)
 
-        # readout controlled variable(s)
-        if y_shape[1] == 1:
-            s_p = jnp.squeeze(jnp.take_along_axis(s_dist_params, horizon[..., None]-1, axis=1), axis=1)
-            curr_s = jnp.squeeze(jnp.take_along_axis(s_t, horizon[..., None]-1, axis=1), axis=1)
-        else:
-            s_p = s_dist_params.copy()
-            curr_s = s_t.copy()
+        disagreement = disagreement.reshape(-1)
 
-        delta_s, s_log_std = get_mean_and_log_std(s_p)
+        s_p = s_dist_params.copy()
+        curr_s = s_t.copy()
+        delta_s, s_log_std = get_mean_and_log_std(s_p)        
         
         # reshape
-        y_mean, y_log_std, y_t = reshape_variables((curr_s+delta_s)[...,self.controlled_variables], # add delta_s to s_t to get s_tp1
-                                                   s_log_std[...,self.controlled_variables],
-                                                   y_t,
-                                                   self.controlled_variables_dim)
-
-        valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
-        if y_shape[1] == 1:
-            y_log_probs, _ = true_fn(y_mean, y_log_std, y_t)
-        else:
-            y_log_probs, _ = batch_get_log_prob(valid_mask, y_mean, y_log_std, y_t)
+        s_mean, s_log_std, s_tp1 = reshape_variables(curr_s+delta_s, # add delta_s to s_t to get s_tp1
+                                                     s_log_std,
+                                                     s_tp1,
+                                                     self.state_dim)
+        
+        curr_s = jnp.squeeze(jnp.take_along_axis(s_t, horizon[..., None]-1, axis=1), axis=1)
+        s_p = jnp.squeeze(jnp.take_along_axis(s_dist_params, horizon[..., None]-1, axis=1), axis=1)
+        delta_s_h, s_log_std_h = get_mean_and_log_std(s_p)   
+        y_mean, y_log_std, y_t = reshape_variables((curr_s+delta_s_h)[...,self.controlled_variables], # add delta_s to s_t to get s_tp1
+                                            s_log_std_h[...,self.controlled_variables],
+                                            y_t,
+                                            self.controlled_variables_dim)
+        
+        threshold = 1e-3
+        object_moving = jnp.linalg.norm(object_velocity, axis=-1) > threshold
+        first_move = jnp.argmax(object_moving, axis=-1) # jnp.argmax returns the first occurrence of the maximum value
+        range_N = jnp.arange(s_t.shape[1])
+        move_mask = range_N[None, :] < first_move[:, None]  # shape (B, N)
+        valid_mask = ((mask * move_mask[:,:,None]).reshape(-1, 1) > 0).squeeze(-1)
+        s_log_probs, _ = batch_get_log_prob(valid_mask, s_mean, s_log_std, s_tp1)
+        y_log_probs, _ = true_fn(y_mean, y_log_std, y_t)
 
         ###################### loss ###################### 
 
@@ -614,14 +748,15 @@ class VAE(linen.Module):
         dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_mean.shape), scale_diag=jnp.ones(z_log_std.shape))
         kl_loss = tfd.kl_divergence(dist_z_post, dist_z_prior).mean()
 
+        y_decoder_loss = jnp.sum(-s_log_probs * valid_mask) / a_shape[0]
+        y_decoder_loss += -y_log_probs.mean()
+
+        valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
+
         # a_decoder_loss = jnp.sum(-a_log_probs * valid_mask) / jnp.sum(valid_mask)
         a_decoder_loss = jnp.sum(a_mse * valid_mask) / a_shape[0]
 
-        if y_shape[1] == 1:
-            y_decoder_loss = -y_log_probs.mean()
-        else:
-            # y_decoder_loss = jnp.sum(-y_log_probs * valid_mask) / jnp.sum(valid_mask)
-            y_decoder_loss = jnp.sum(-y_log_probs * valid_mask) / a_shape[0]
+        disagreement_loss = jnp.sum(disagreement * valid_mask) / a_shape[0]
 
         # smoothness = compute_smoothness(actions)
 
@@ -629,8 +764,9 @@ class VAE(linen.Module):
         kl_loss /= self.act_dim
         a_decoder_loss /= self.act_dim
         y_decoder_loss /= self.act_dim
+        disagreement_loss /= self.act_dim
 
-        return kl_loss, a_decoder_loss, y_decoder_loss
+        return kl_loss, a_decoder_loss, y_decoder_loss, disagreement_loss
     
 class empowerment(linen.Module):
     state_dim: int
