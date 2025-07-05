@@ -751,6 +751,7 @@ class flow_model(linen.Module):
 
         return make_flow()
 
+from jax.lax import stop_gradient
 class empowerment(linen.Module):
     state_dim: int
     act_dim: int
@@ -768,6 +769,10 @@ class empowerment(linen.Module):
         self.encoder = MLP(out_dim=self.controlled_variables_dim*2,
                            h_dims=[256,256])
 
+        dummy_s_t = jnp.zeros((1,self.state_dim))
+        dummy_y_t = jnp.zeros((1,self.controlled_variables_dim))
+        _ = self.encoder( jnp.concatenate([dummy_s_t, dummy_y_t], axis=-1))
+
         self.flow = flow_model(h_dims_conditioner=256,
                                num_bijector_params=2,
                                num_coupling_layers=2,
@@ -778,7 +783,11 @@ class empowerment(linen.Module):
                                       context_len=self.context_len,
                                       hidden_size=256)
 
-    def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_apply, dynamics_params, key):
+        dummy_s_t = jnp.zeros((1,self.context_len,self.state_dim))
+        dummy_z_t = jnp.zeros((1,self.controlled_variables_dim))
+        _ = self.precoder(dummy_s_t, dummy_z_t)
+
+    def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, train_precoder, dynamics_apply, dynamics_params, key):
 
         sample_z_key, sample_i_key, sample_y_key = jax.random.split(key, 3)
 
@@ -791,7 +800,18 @@ class empowerment(linen.Module):
 
         ###################### precode ###################### 
 
-        actions = self.precoder(s_t, z_t)
+        precoder_apply = self.precoder.apply
+
+        def apply_with_grad(precoder_params, s_t, z_t):
+            return precoder_apply({'params': precoder_params}, s_t, z_t)
+
+        def apply_without_grad(precoder_params, s_t, z_t):
+            return precoder_apply({'params': jax.lax.stop_gradient(precoder_params)}, s_t, z_t)
+
+        actions = jax.lax.cond(train_precoder,
+                            apply_with_grad,
+                            apply_without_grad,
+                            self.variables['params']['precoder'], s_t, z_t)
 
         ###################### sample controlled variable ###################### 
 
@@ -817,7 +837,19 @@ class empowerment(linen.Module):
                                                   scale_diag=jnp.exp(y_log_std[idx]))
         delta_y = delta_y_dist.sample(seed=sample_y_key)
         y_samp = s_t[:,:1,self.controlled_variables] + delta_y
-        z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_samp[:,0,:]], axis=-1))
+
+        encoder_apply = self.encoder.apply
+
+        def apply_encoder_with_grad(encoder_params, s_t_y_samp):
+            return encoder_apply({'params': encoder_params}, s_t_y_samp)
+
+        def apply_encoder_without_grad(encoder_params, s_t_y_samp):
+            return encoder_apply({'params': jax.lax.stop_gradient(encoder_params)}, s_t_y_samp)
+
+        z_dist_params = jax.lax.cond(train_precoder,
+                            apply_encoder_without_grad,
+                            apply_encoder_with_grad,
+                            self.variables['params']['encoder'], jnp.concatenate([s_t[:,0,:], y_samp[:,0,:]], axis=-1))
 
         # # use all dynamics models in ensemble
         # delta_y_dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
@@ -827,21 +859,23 @@ class empowerment(linen.Module):
 
         ###################### encode NF ###################### 
 
-        z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
-        min_log_std = -20.
-        max_log_std = 2.
-        z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
-        base_post_dist = distrax.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
-        bijector = self.flow()
-        post_dist = distrax.Transformed(base_post_dist, bijector)
-            
-        ###################### encode MLP posterior ###################### 
-
         # z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
         # min_log_std = -20.
         # max_log_std = 2.
         # z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
-        # post_dist = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
+        # base_post_dist = distrax.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
+        # bijector = self.flow()
+        # post_dist = distrax.Transformed(base_post_dist, bijector)
+            
+        ###################### encode MLP posterior ###################### 
+
+        # here i clip the variance of the posterior to 1, as it was 1 in the prior
+        # and the posterior variance should be less than the prior
+        z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
+        min_log_std = -20.
+        max_log_std = 0.
+        z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
+        post_dist = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
 
         ###################### loss ###################### 
 

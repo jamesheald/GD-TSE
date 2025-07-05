@@ -964,6 +964,7 @@ def train(args):
                                 rtg_t=dummy_rtg,
                                 horizon=dummy_horizon,
                                 mask=dummy_mask,
+                                train_precoder=True,
                                 dynamics_apply=dynamics_model.apply,
                                 dynamics_params=_dynamics_params,
                                 key=key_params)
@@ -985,7 +986,7 @@ def train(args):
     print(f'num_emp_param: {param_count}')
 
     def emp_loss(emp_params: Any,
-                   transitions: Transition, key: jnp.ndarray) -> jnp.ndarray:
+                   transitions: Transition, key: jnp.ndarray, train_precoder: bool) -> jnp.ndarray:
         ts = transitions.ts.reshape(transitions.ts.shape[:2]).astype(jnp.int32)  # (batch_size_per_device, context_len)
         s_t = transitions.s_t  # (batch_size_per_device, context_len, state_dim)
         a_t = transitions.a_t  # (batch_size_per_device, context_len, action_dim)
@@ -1003,17 +1004,22 @@ def train(args):
 
         emp_key, dropout_key = jax.random.split(key, 2)
 
-        loss = emp_model.apply(emp_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, emp_key, rngs={'dropout': dropout_key})
+        loss = emp_model.apply(emp_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, train_precoder, dynamics_model.apply, _dynamics_params, emp_key, rngs={'dropout': dropout_key})
 
         return loss
 
+    # emp_grad = jax.jit(jax.value_and_grad(emp_loss), static_argnames=('train_precoder'))
     emp_grad = jax.jit(jax.value_and_grad(emp_loss))
 
     @jax.jit
+    # @partial(jax.jit, static_argnames=["train_precoder"])
     def update_step_emp(
-        state: TrainingState,
+        # state: TrainingState,
+        carry,
         transitions: jnp.ndarray,
     ) -> Tuple[TrainingState, bool, Dict[str, jnp.ndarray]]:
+
+        state, train_precoder = carry
 
         cumsum_dims = np.cumsum([obs_dim, act_dim, obs_dim, 1, 1, 1])
 
@@ -1028,7 +1034,7 @@ def train(args):
 
         key, key_emp = jax.random.split(state.key, 2)
 
-        loss, emp_grads = emp_grad(state.params, transitions, key_emp)
+        loss, emp_grads = emp_grad(state.params, transitions, key_emp, train_precoder)
         emp_grads = jax.lax.pmean(emp_grads, axis_name='i')
         emp_params_update, emp_optimizer_state = emp_optimizer.update(
             emp_grads, state.optimizer_state, state.params)
@@ -1041,7 +1047,10 @@ def train(args):
             params=emp_params,
             key=key,
             steps=state.steps + 1)
-        return new_state, metrics
+        
+        carry = new_state, train_precoder
+
+        return carry, metrics
     
     def sample_data_emp(training_state, replay_buffer, max_epi_len):
         # num_updates_per_iter
@@ -1071,23 +1080,24 @@ def train(args):
         return training_state, transitions
 
     def run_one_epoch_emp(carry, unused_t, max_epi_len):
-        training_state, replay_buffer = carry
+        training_state, replay_buffer, train_precoder = carry
 
         training_state, transitions = sample_data_emp(training_state, replay_buffer, max_epi_len)
-        training_state, metrics = jax.lax.scan(
-            update_step_emp, training_state, transitions, length=1)
-        return (training_state, replay_buffer), metrics
+        (training_state, train_precoder), metrics = jax.lax.scan(
+            update_step_emp, (training_state, train_precoder), transitions, length=1)
+        return (training_state, replay_buffer, train_precoder), metrics
 
-    def run_training_emp(training_state, replay_buffer, max_epi_len):
+    def run_training_emp(training_state, replay_buffer, train_precoder, max_epi_len):
         synchro = is_replicated(
             training_state.replace(key=jax.random.PRNGKey(0)), axis_name='i')
-        (training_state, replay_buffer), metrics = jax.lax.scan(
-            partial(run_one_epoch_emp, max_epi_len=max_epi_len), (training_state, replay_buffer), (),
+        (training_state, replay_buffer, train_precoder), metrics = jax.lax.scan(
+            partial(run_one_epoch_emp, max_epi_len=max_epi_len), (training_state, replay_buffer, train_precoder), (),
             length=num_updates_per_iter)
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
         return training_state, replay_buffer, metrics, synchro
     
-    run_training_emp = jax.pmap(partial(run_training_emp, max_epi_len=max_epi_len), axis_name='i')
+    train_precoder = True
+    run_training_emp = jax.pmap(partial(run_training_emp, max_epi_len=max_epi_len, train_precoder=train_precoder), axis_name='i')
     # run_training_emp = partial(run_training_emp, max_epi_len=max_epi_len)
 
     emp_training_state = TrainingState(
@@ -1107,10 +1117,18 @@ def train(args):
 
         # optimization
         emp_training_state, replay_buffer, training_metrics, synchro = run_training_emp(
-            emp_training_state, replay_buffer)
+            emp_training_state, replay_buffer, train_precoder=jnp.array([True],))
         assert synchro[0], (current_step, emp_training_state)
         jax.tree_util.tree_map(lambda x: x.block_until_ready(), training_metrics)
-        log_emp_losses.append(training_metrics['loss'])
+        precoder_loss = training_metrics['loss']
+
+        emp_training_state, replay_buffer, training_metrics, synchro = run_training_emp(
+            emp_training_state, replay_buffer, train_precoder=jnp.array([False],))
+        assert synchro[0], (current_step, emp_training_state)
+        jax.tree_util.tree_map(lambda x: x.block_until_ready(), training_metrics)
+        posterior_loss = training_metrics['loss']
+
+        log_emp_losses.append((precoder_loss + posterior_loss)/2)
 
         mean_emp_loss = np.mean(log_emp_losses)
         time_elapsed = str(datetime.now().replace(microsecond=0) - start_time)
