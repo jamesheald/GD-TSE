@@ -245,7 +245,7 @@ def train(args):
         encoder_params = {'params': params['params']['encoder']}
         precoder_params = {'params': params['params']['precoder']}
 
-        def get_actions(s_t, key):
+        def get_actions(obs, key):
 
             # s_t = jnp.concatenate((minari_env.unwrapped.get_env_state()['qpos'], minari_env.unwrapped.get_env_state()['qpos']))[None, :]
 
@@ -259,20 +259,24 @@ def train(args):
 
             # sample from prior
             z_t = dist_z_prior.sample(seed=key)
-            
-            actions = jax.jit(eval_precoder.apply)(precoder_params, normalize_obs(s_t)[None,None, :], z_t)
 
-            return actions
+            target_agnostic_obs = obs - np.concatenate((np.zeros(33),
+                                                        obs[33:36],
+                                                        obs[33:36]))
+            
+            actions = jax.jit(eval_precoder.apply)(precoder_params, normalize_obs(target_agnostic_obs)[None,None, :], z_t)
+
+            return actions[0,:,:]
 
         n_rollouts = 3
         for rollout in range(n_rollouts):
             obs, _ = minari_env.reset()
-            ep = 0
+            # ep = 0
             # initial_state = unnormalize_obs(replay_buffer.data[0,ep,0,:72])
             # minari_env.unwrapped.set_state(qpos=initial_state[:36], qvel=initial_state[36:72])
             frames = []
             key = jax.random.PRNGKey(seed)
-            actions = get_actions(obs, key)[0,:,:]
+            actions = get_actions(obs, key)
             for t in range(50):
                 # key, subkey = jax.random.split(key)
                 # action = get_actions(obs, ep, t, subkey)[0,0,:]
@@ -285,7 +289,7 @@ def train(args):
 
         plt.figure()
         for i in range(actions.shape[-1]):
-            plt.plot(actions[0,:,i])
+            plt.plot(actions[:,i])
         plt.savefig(os.path.join(log_dir, 'actions_' + loop + '_' + model + '_' + str(iter) + '_' + str(rollout) + '.png'))
         plt.close()
 
@@ -630,284 +634,284 @@ def train(args):
         trajectory_version=args.trajectory_version
     )
     
-    if args.resume_start_time_str is None or args.resume_vae is False:
+    # if args.resume_start_time_str is None or args.resume_vae is False:
 
-        schedule_fn = optax.polynomial_schedule(
-            init_value=lr * 1 / warmup_steps,
-            end_value=lr,
-            power=1,
-            transition_steps=warmup_steps,
-            transition_begin=0
-        )
-        vae_optimizer = optax.chain(
-            optax.clip(args.gradient_clipping),
-            optax.adamw(learning_rate=schedule_fn, weight_decay=wt_decay),
-        )
+    #     schedule_fn = optax.polynomial_schedule(
+    #         init_value=lr * 1 / warmup_steps,
+    #         end_value=lr,
+    #         power=1,
+    #         transition_steps=warmup_steps,
+    #         transition_begin=0
+    #     )
+    #     vae_optimizer = optax.chain(
+    #         optax.clip(args.gradient_clipping),
+    #         optax.adamw(learning_rate=schedule_fn, weight_decay=wt_decay),
+    #     )
 
-        batch_size = 1
-        dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
-        dummy_states = jnp.zeros((batch_size, context_len, obs_dim))
-        dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
-        if args.trajectory_version:
-            dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
-            dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
-        else:
-            dummy_latent = jnp.zeros((batch_size, controlled_variables_dim))
-            dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
-        dummy_rtg = jnp.zeros((batch_size, context_len, 1))
-        dummy_horizon= jnp.ones((batch_size, 1), dtype=jnp.int32)
-        dummy_mask = jnp.ones((batch_size, context_len, 1))
+    #     batch_size = 1
+    #     dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
+    #     dummy_states = jnp.zeros((batch_size, context_len, obs_dim))
+    #     dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
+    #     if args.trajectory_version:
+    #         dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
+    #         dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+    #     else:
+    #         dummy_latent = jnp.zeros((batch_size, controlled_variables_dim))
+    #         dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
+    #     dummy_rtg = jnp.zeros((batch_size, context_len, 1))
+    #     dummy_horizon= jnp.ones((batch_size, 1), dtype=jnp.int32)
+    #     dummy_mask = jnp.ones((batch_size, context_len, 1))
 
-        key_params, key_dropout = jax.random.split(global_key_vae)
-        vae_params = vae_model.init({'params': key_params, 'dropout': key_dropout},
-                                    ts=dummy_timesteps,
-                                    s_t=dummy_states,
-                                    z_t=dummy_latent,
-                                    a_t=dummy_actions,
-                                    y_t=dummy_controlled_variables,
-                                    rtg_t=dummy_rtg,
-                                    horizon=dummy_horizon,
-                                    mask=dummy_mask,
-                                    dynamics_apply=dynamics_model.apply,
-                                    dynamics_params=_dynamics_params,
-                                    key=key_params)
+    #     key_params, key_dropout = jax.random.split(global_key_vae)
+    #     vae_params = vae_model.init({'params': key_params, 'dropout': key_dropout},
+    #                                 ts=dummy_timesteps,
+    #                                 s_t=dummy_states,
+    #                                 z_t=dummy_latent,
+    #                                 a_t=dummy_actions,
+    #                                 y_t=dummy_controlled_variables,
+    #                                 rtg_t=dummy_rtg,
+    #                                 horizon=dummy_horizon,
+    #                                 mask=dummy_mask,
+    #                                 dynamics_apply=dynamics_model.apply,
+    #                                 dynamics_params=_dynamics_params,
+    #                                 key=key_params)
     
-    else:
+    # else:
 
-        vae_optimizer = optax.chain(
-            optax.clip(args.gradient_clipping),
-            optax.adamw(learning_rate=lr, weight_decay=wt_decay),
-        )
+    #     vae_optimizer = optax.chain(
+    #         optax.clip(args.gradient_clipping),
+    #         optax.adamw(learning_rate=lr, weight_decay=wt_decay),
+    #     )
 
-        total_updates = 300000
-        load_model_path = os.path.join(log_dir, "vae_model.pt")
-        load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
-        vae_params = load_params(load_current_model_path)
+    #     total_updates = 300000
+    #     load_model_path = os.path.join(log_dir, "vae_model.pt")
+    #     load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
+    #     vae_params = load_params(load_current_model_path)
     
-    vae_optimizer_state = vae_optimizer.init(vae_params)
+    # vae_optimizer_state = vae_optimizer.init(vae_params)
 
-    vae_optimizer_state, vae_params = bcast_local_devices(
-        (vae_optimizer_state, vae_params), local_devices_to_use)
+    # vae_optimizer_state, vae_params = bcast_local_devices(
+    #     (vae_optimizer_state, vae_params), local_devices_to_use)
 
-    # count the number of parameters
-    param_count = sum(x.size for x in jax.tree_util.tree_leaves(vae_params))
-    print(f'num_vae_param: {param_count}')
+    # # count the number of parameters
+    # param_count = sum(x.size for x in jax.tree_util.tree_leaves(vae_params))
+    # print(f'num_vae_param: {param_count}')
 
-    def vae_loss(vae_params: Any,
-                 transitions: Transition,
-                 key: jnp.ndarray, #  ) -> jnp.ndarray:
-                 w) -> jnp.ndarray:
-        ts = transitions.ts.reshape(transitions.ts.shape[:2]).astype(jnp.int32)  # (batch_size_per_device, context_len)
-        s_t = transitions.s_t  # (batch_size_per_device, context_len, state_dim)
-        a_t = transitions.a_t  # (batch_size_per_device, context_len, action_dim)
-        s_tp1 = transitions.s_tp1
-        rtg_t = transitions.rtg_t  # (batch_size_per_device, context_len, 1)
-        mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
+    # def vae_loss(vae_params: Any,
+    #              transitions: Transition,
+    #              key: jnp.ndarray, #  ) -> jnp.ndarray:
+    #              w) -> jnp.ndarray:
+    #     ts = transitions.ts.reshape(transitions.ts.shape[:2]).astype(jnp.int32)  # (batch_size_per_device, context_len)
+    #     s_t = transitions.s_t  # (batch_size_per_device, context_len, state_dim)
+    #     a_t = transitions.a_t  # (batch_size_per_device, context_len, action_dim)
+    #     s_tp1 = transitions.s_tp1
+    #     rtg_t = transitions.rtg_t  # (batch_size_per_device, context_len, 1)
+    #     mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
         
-        horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
+    #     horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
         
-        if args.trajectory_version:
-            y_t = transitions.s_tp1[...,controlled_variables]  # (batch_size_per_device, context_len, controlled_variables_dim)
-            dummy_z_t = jnp.zeros((vae_batch_size_per_device, context_len * controlled_variables_dim))
-        else:
-            y_t = jnp.take_along_axis(s_tp1, horizon[..., None]-1, axis=1)[...,controlled_variables]
-            dummy_z_t = jnp.zeros((vae_batch_size_per_device, controlled_variables_dim))
+    #     if args.trajectory_version:
+    #         y_t = transitions.s_tp1[...,controlled_variables]  # (batch_size_per_device, context_len, controlled_variables_dim)
+    #         dummy_z_t = jnp.zeros((vae_batch_size_per_device, context_len * controlled_variables_dim))
+    #     else:
+    #         y_t = jnp.take_along_axis(s_tp1, horizon[..., None]-1, axis=1)[...,controlled_variables]
+    #         dummy_z_t = jnp.zeros((vae_batch_size_per_device, controlled_variables_dim))
 
-        vae_key, dropout_key = jax.random.split(key, 2)
+    #     vae_key, dropout_key = jax.random.split(key, 2)
 
-        kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss = vae_model.apply(vae_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, vae_key, rngs={'dropout': dropout_key})
+    #     kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss = vae_model.apply(vae_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, vae_key, rngs={'dropout': dropout_key})
 
-        # return kl_loss + controlled_variable_decoder_loss, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss)
-        # return kl_loss + action_decoder_loss + controlled_variable_decoder_loss + disagreement_loss * args.uncertainty_weight, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss)
-        return kl_loss + action_decoder_loss * (1-w) + controlled_variable_decoder_loss * w + disagreement_loss * args.uncertainty_weight, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss)
+    #     # return kl_loss + controlled_variable_decoder_loss, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss)
+    #     # return kl_loss + action_decoder_loss + controlled_variable_decoder_loss + disagreement_loss * args.uncertainty_weight, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss)
+    #     return kl_loss + action_decoder_loss * (1-w) + controlled_variable_decoder_loss * w + disagreement_loss * args.uncertainty_weight, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss)
 
-    vae_grad = jax.jit(jax.value_and_grad(vae_loss, has_aux=True))
+    # vae_grad = jax.jit(jax.value_and_grad(vae_loss, has_aux=True))
 
-    @jax.jit
-    def update_step_vae(
-        state: TrainingState,
-        transitions: jnp.ndarray,
-    ) -> Tuple[TrainingState, bool, Dict[str, jnp.ndarray]]:
+    # @jax.jit
+    # def update_step_vae(
+    #     state: TrainingState,
+    #     transitions: jnp.ndarray,
+    # ) -> Tuple[TrainingState, bool, Dict[str, jnp.ndarray]]:
 
-        cumsum_dims = np.cumsum([obs_dim, act_dim, obs_dim, 1, 1, 1])
+    #     cumsum_dims = np.cumsum([obs_dim, act_dim, obs_dim, 1, 1, 1])
 
-        transitions = Transition(
-            s_t=transitions[:, :, :cumsum_dims[0]],
-            a_t=transitions[:, :, cumsum_dims[0]:cumsum_dims[1]],
-            s_tp1=transitions[:, :, cumsum_dims[1]:cumsum_dims[2]],
-            rtg_t=transitions[:, :, cumsum_dims[2]:cumsum_dims[3]],
-            ts=transitions[:, :, cumsum_dims[3]:cumsum_dims[4]],
-            mask_t=transitions[:, :, cumsum_dims[4]:cumsum_dims[5]]
-        )
+    #     transitions = Transition(
+    #         s_t=transitions[:, :, :cumsum_dims[0]],
+    #         a_t=transitions[:, :, cumsum_dims[0]:cumsum_dims[1]],
+    #         s_tp1=transitions[:, :, cumsum_dims[1]:cumsum_dims[2]],
+    #         rtg_t=transitions[:, :, cumsum_dims[2]:cumsum_dims[3]],
+    #         ts=transitions[:, :, cumsum_dims[3]:cumsum_dims[4]],
+    #         mask_t=transitions[:, :, cumsum_dims[4]:cumsum_dims[5]]
+    #     )
 
-        key, key_vae = jax.random.split(state.key, 2)
+    #     key, key_vae = jax.random.split(state.key, 2)
 
-        w = state.steps/(num_updates_per_iter*1_000)
-        if args.y_decoder_weight is None:
-            w = jnp.clip(w, 0., 1.)
-        else:
-            w = jnp.clip(args.y_decoder_weight, 0., 1.)
+    #     w = state.steps/(num_updates_per_iter*1_000)
+    #     if args.y_decoder_weight is None:
+    #         w = jnp.clip(w, 0., 1.)
+    #     else:
+    #         w = jnp.clip(args.y_decoder_weight, 0., 1.)
 
-        (loss, (kl_loss, a_decoder_loss, y_decoder_loss, disagreement_loss)), vae_grads = vae_grad(state.params, transitions, key_vae, w)
-        vae_grads = jax.lax.pmean(vae_grads, axis_name='i')
-        vae_params_update, vae_optimizer_state = vae_optimizer.update(
-            vae_grads, state.optimizer_state, state.params)
-        vae_params = optax.apply_updates(state.params, vae_params_update)
+    #     (loss, (kl_loss, a_decoder_loss, y_decoder_loss, disagreement_loss)), vae_grads = vae_grad(state.params, transitions, key_vae, w)
+    #     vae_grads = jax.lax.pmean(vae_grads, axis_name='i')
+    #     vae_params_update, vae_optimizer_state = vae_optimizer.update(
+    #         vae_grads, state.optimizer_state, state.params)
+    #     vae_params = optax.apply_updates(state.params, vae_params_update)
 
-        metrics = {'loss': loss,
-                   'kl_loss': kl_loss,
-                   'a_decoder_loss': a_decoder_loss,
-                   'y_decoder_loss': y_decoder_loss,
-                   'weight': w,
-                   'disagreement_loss': disagreement_loss}
+    #     metrics = {'loss': loss,
+    #                'kl_loss': kl_loss,
+    #                'a_decoder_loss': a_decoder_loss,
+    #                'y_decoder_loss': y_decoder_loss,
+    #                'weight': w,
+    #                'disagreement_loss': disagreement_loss}
 
-        new_state = TrainingState(
-            optimizer_state=vae_optimizer_state,
-            params=vae_params,
-            key=key,
-            steps=state.steps + 1)
-        return new_state, metrics
+    #     new_state = TrainingState(
+    #         optimizer_state=vae_optimizer_state,
+    #         params=vae_params,
+    #         key=key,
+    #         steps=state.steps + 1)
+    #     return new_state, metrics
 
-    def sample_data_vae(training_state, replay_buffer, max_epi_len):
-            # num_updates_per_iter
-            key1, key2, key3 = jax.random.split(training_state.key, 3)
-            epi_idx = jax.random.randint(
-                key1, (int(vae_batch_size_per_device*grad_updates_per_step),),
-                minval=0,
-                maxval=replay_buffer.data.shape[0])  # from (0, num_epi)
-            context_idx = jax.random.randint(
-                key2, (int(vae_batch_size_per_device*grad_updates_per_step),),
-                minval=0,
-                maxval=max_epi_len)  # from (0, max_epi_len)
+    # def sample_data_vae(training_state, replay_buffer, max_epi_len):
+    #         # num_updates_per_iter
+    #         key1, key2, key3 = jax.random.split(training_state.key, 3)
+    #         epi_idx = jax.random.randint(
+    #             key1, (int(vae_batch_size_per_device*grad_updates_per_step),),
+    #             minval=0,
+    #             maxval=replay_buffer.data.shape[0])  # from (0, num_epi)
+    #         context_idx = jax.random.randint(
+    #             key2, (int(vae_batch_size_per_device*grad_updates_per_step),),
+    #             minval=0,
+    #             maxval=max_epi_len)  # from (0, max_epi_len)
 
-            def dynamic_slice_context(carry, x):
-                traj, c_idx = x
-                return (), jax.lax.dynamic_slice(traj, (c_idx, 0), (context_len, trans_dim))
+    #         def dynamic_slice_context(carry, x):
+    #             traj, c_idx = x
+    #             return (), jax.lax.dynamic_slice(traj, (c_idx, 0), (context_len, trans_dim))
 
-            # (batch_size_per_device*num_updates_per_iter, max_epi_len + context_len, trans_dim)
-            transitions = jnp.take(replay_buffer.data, epi_idx, axis=0, mode='clip')
-            # (batch_size_per_device*num_updates_per_iter, context_len, trans_dim)
-            _, transitions = jax.lax.scan(dynamic_slice_context, (), (transitions, context_idx))
-            # (num_updates_per_iter, batch_size_per_device, context_len, trans_dim)
-            transitions = jnp.reshape(transitions,
-                                    [grad_updates_per_step, -1] + list(transitions.shape[1:]))
+    #         # (batch_size_per_device*num_updates_per_iter, max_epi_len + context_len, trans_dim)
+    #         transitions = jnp.take(replay_buffer.data, epi_idx, axis=0, mode='clip')
+    #         # (batch_size_per_device*num_updates_per_iter, context_len, trans_dim)
+    #         _, transitions = jax.lax.scan(dynamic_slice_context, (), (transitions, context_idx))
+    #         # (num_updates_per_iter, batch_size_per_device, context_len, trans_dim)
+    #         transitions = jnp.reshape(transitions,
+    #                                 [grad_updates_per_step, -1] + list(transitions.shape[1:]))
 
-            training_state = training_state.replace(key=key3)
-            return training_state, transitions
+    #         training_state = training_state.replace(key=key3)
+    #         return training_state, transitions
 
-    def run_one_epoch_vae(carry, unused_t, max_epi_len):
-        training_state, replay_buffer = carry
+    # def run_one_epoch_vae(carry, unused_t, max_epi_len):
+    #     training_state, replay_buffer = carry
 
-        training_state, transitions = sample_data_vae(training_state, replay_buffer, max_epi_len)
-        training_state, metrics = jax.lax.scan(
-            update_step_vae, training_state, transitions, length=1)
-        return (training_state, replay_buffer), metrics
+    #     training_state, transitions = sample_data_vae(training_state, replay_buffer, max_epi_len)
+    #     training_state, metrics = jax.lax.scan(
+    #         update_step_vae, training_state, transitions, length=1)
+    #     return (training_state, replay_buffer), metrics
 
-    def run_training_vae(training_state, replay_buffer, max_epi_len):
-        synchro = is_replicated(
-            training_state.replace(key=jax.random.PRNGKey(0)), axis_name='i')
-        (training_state, replay_buffer), metrics = jax.lax.scan(
-            partial(run_one_epoch_vae, max_epi_len=max_epi_len), (training_state, replay_buffer), (),
-            length=num_updates_per_iter)
-        metrics = jax.tree_util.tree_map(jnp.mean, metrics)
-        return training_state, replay_buffer, metrics, synchro
+    # def run_training_vae(training_state, replay_buffer, max_epi_len):
+    #     synchro = is_replicated(
+    #         training_state.replace(key=jax.random.PRNGKey(0)), axis_name='i')
+    #     (training_state, replay_buffer), metrics = jax.lax.scan(
+    #         partial(run_one_epoch_vae, max_epi_len=max_epi_len), (training_state, replay_buffer), (),
+    #         length=num_updates_per_iter)
+    #     metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+    #     return training_state, replay_buffer, metrics, synchro
     
-    run_training_vae = jax.pmap(partial(run_training_vae, max_epi_len=max_epi_len), axis_name='i')
+    # run_training_vae = jax.pmap(partial(run_training_vae, max_epi_len=max_epi_len), axis_name='i')
 
-    vae_training_state = TrainingState(
-        optimizer_state=vae_optimizer_state,
-        params=vae_params,
-        key=jnp.stack(jax.random.split(local_key, local_devices_to_use)),
-        steps=jnp.zeros((local_devices_to_use,)))
+    # vae_training_state = TrainingState(
+    #     optimizer_state=vae_optimizer_state,
+    #     params=vae_params,
+    #     key=jnp.stack(jax.random.split(local_key, local_devices_to_use)),
+    #     steps=jnp.zeros((local_devices_to_use,)))
 
-    total_updates = 0
+    # total_updates = 0
 
-    save_model_path = os.path.join(log_dir, "vae_model.pt")
+    # save_model_path = os.path.join(log_dir, "vae_model.pt")
 
-    for i_train_iter in range(max_train_iters):
-        log_vae_losses = []
-        log_kl_losses = []
-        log_a_decoder_losses = []
-        log_y_decoder_losses = []
-        disagreement_losses = []
-        weights = []
+    # for i_train_iter in range(max_train_iters):
+    #     log_vae_losses = []
+    #     log_kl_losses = []
+    #     log_a_decoder_losses = []
+    #     log_y_decoder_losses = []
+    #     disagreement_losses = []
+    #     weights = []
 
-        # optimization
-        vae_training_state, replay_buffer, training_metrics, synchro = run_training_vae(
-            vae_training_state, replay_buffer)
-        assert synchro[0], (current_step, vae_training_state)
-        jax.tree_util.tree_map(lambda x: x.block_until_ready(), training_metrics)
-        log_vae_losses.append(training_metrics['loss'])
-        log_kl_losses.append(training_metrics['kl_loss'])
-        log_a_decoder_losses.append(training_metrics['a_decoder_loss'])
-        log_y_decoder_losses.append(training_metrics['y_decoder_loss'])
-        weights.append(training_metrics['weight'])
-        disagreement_losses.append(training_metrics['disagreement_loss'])
+    #     # optimization
+    #     vae_training_state, replay_buffer, training_metrics, synchro = run_training_vae(
+    #         vae_training_state, replay_buffer)
+    #     assert synchro[0], (current_step, vae_training_state)
+    #     jax.tree_util.tree_map(lambda x: x.block_until_ready(), training_metrics)
+    #     log_vae_losses.append(training_metrics['loss'])
+    #     log_kl_losses.append(training_metrics['kl_loss'])
+    #     log_a_decoder_losses.append(training_metrics['a_decoder_loss'])
+    #     log_y_decoder_losses.append(training_metrics['y_decoder_loss'])
+    #     weights.append(training_metrics['weight'])
+    #     disagreement_losses.append(training_metrics['disagreement_loss'])
 
-        mean_vae_loss = np.mean(log_vae_losses)
-        mean_kl_loss = np.mean(log_kl_losses)
-        mean_a_decoder_loss = np.mean(log_a_decoder_losses)
-        mean_y_decoder_loss = np.mean(log_y_decoder_losses)
-        mean_weights = np.mean(weights)
-        mean_disagreement_losses = np.mean(disagreement_losses)
-        time_elapsed = str(datetime.now().replace(microsecond=0) - start_time)
+    #     mean_vae_loss = np.mean(log_vae_losses)
+    #     mean_kl_loss = np.mean(log_kl_losses)
+    #     mean_a_decoder_loss = np.mean(log_a_decoder_losses)
+    #     mean_y_decoder_loss = np.mean(log_y_decoder_losses)
+    #     mean_weights = np.mean(weights)
+    #     mean_disagreement_losses = np.mean(disagreement_losses)
+    #     time_elapsed = str(datetime.now().replace(microsecond=0) - start_time)
 
-        total_updates += num_updates_per_iter
+    #     total_updates += num_updates_per_iter
 
-        log_str = ("=" * 60 + '\n' +
-                   "time elapsed: " + time_elapsed  + '\n' +
-                   "train iter: " + str(i_train_iter)  + '\n' +
-                   "num of updates: " + str(total_updates) + '\n' +
-                   "vae loss: " +  format(mean_vae_loss, ".5f") + '\n' +
-                   "kl loss: " +  format(mean_kl_loss, ".5f") + '\n' +
-                   "a decoder loss: " +  format(mean_a_decoder_loss, ".5f") + '\n' + 
-                   "y decoder loss: " +  format(mean_y_decoder_loss, ".5f") + '\n' + 
-                   "mean weights: " +  format(mean_weights, ".5f") + '\n' + 
-                   "mean disagreement losses: " +  format(mean_disagreement_losses, ".5f") + '\n'
-                )
+    #     log_str = ("=" * 60 + '\n' +
+    #                "time elapsed: " + time_elapsed  + '\n' +
+    #                "train iter: " + str(i_train_iter)  + '\n' +
+    #                "num of updates: " + str(total_updates) + '\n' +
+    #                "vae loss: " +  format(mean_vae_loss, ".5f") + '\n' +
+    #                "kl loss: " +  format(mean_kl_loss, ".5f") + '\n' +
+    #                "a decoder loss: " +  format(mean_a_decoder_loss, ".5f") + '\n' + 
+    #                "y decoder loss: " +  format(mean_y_decoder_loss, ".5f") + '\n' + 
+    #                "mean weights: " +  format(mean_weights, ".5f") + '\n' + 
+    #                "mean disagreement losses: " +  format(mean_disagreement_losses, ".5f") + '\n'
+    #             )
 
-        print(log_str)
+    #     print(log_str)
 
-        wandb.log({'mean_vae_loss': mean_vae_loss,
-                   'mean_kl_loss': mean_kl_loss,
-                   'mean_a_decoder_loss': mean_a_decoder_loss,
-                   'mean_y_decoder_loss': mean_y_decoder_loss,
-                   'mean_weight_(y_decoder)': mean_weights,
-                   'mean disagreement losses': mean_disagreement_losses})
+    #     wandb.log({'mean_vae_loss': mean_vae_loss,
+    #                'mean_kl_loss': mean_kl_loss,
+    #                'mean_a_decoder_loss': mean_a_decoder_loss,
+    #                'mean_y_decoder_loss': mean_y_decoder_loss,
+    #                'mean_weight_(y_decoder)': mean_weights,
+    #                'mean disagreement losses': mean_disagreement_losses})
 
-        log_data = [
-            time_elapsed,
-            total_updates,
-            mean_vae_loss,
-            mean_kl_loss,
-            mean_a_decoder_loss,
-            mean_y_decoder_loss
-        ]
+    #     log_data = [
+    #         time_elapsed,
+    #         total_updates,
+    #         mean_vae_loss,
+    #         mean_kl_loss,
+    #         mean_a_decoder_loss,
+    #         mean_y_decoder_loss
+    #     ]
 
-        csv_writer.writerow(log_data)
+    #     csv_writer.writerow(log_data)
 
-        # save model
-        _vae_params = jax.tree_util.tree_map(lambda x: x[0], vae_training_state.params)
+    #     # save model
+    #     _vae_params = jax.tree_util.tree_map(lambda x: x[0], vae_training_state.params)
 
-        if i_train_iter % args.vae_save_iters == 0 or i_train_iter == max_train_iters - 1:
-            save_current_model_path = save_model_path[:-3] + f"_{total_updates}.pt"
-            print("saving current model at: " + save_current_model_path)
-            save_params(save_current_model_path, _vae_params)
-            eval_model('vae', _vae_params, total_updates) # for model in ['vae', 'emp']:
+    #     if i_train_iter % args.vae_save_iters == 0 or i_train_iter == max_train_iters - 1:
+    #         save_current_model_path = save_model_path[:-3] + f"_{total_updates}.pt"
+    #         print("saving current model at: " + save_current_model_path)
+    #         save_params(save_current_model_path, _vae_params)
+    #         eval_model('vae', _vae_params, total_updates) # for model in ['vae', 'emp']:
 
-    synchronize_hosts()
+    # synchronize_hosts()
     
-    print("=" * 60)
-    print("finished training vae!")
-    print("=" * 60)
-    end_time = datetime.now().replace(microsecond=0)
-    time_elapsed = str(end_time - start_time)
-    end_time_str = end_time.strftime("%y-%m-%d-%H-%M-%S")
-    print("started training vae at: " + start_time_str)
-    print("finished training vae at: " + end_time_str)
-    print("total vae training time: " + time_elapsed)
-    print("saved last updated model at: " + save_model_path)
-    print("=" * 60)
+    # print("=" * 60)
+    # print("finished training vae!")
+    # print("=" * 60)
+    # end_time = datetime.now().replace(microsecond=0)
+    # time_elapsed = str(end_time - start_time)
+    # end_time_str = end_time.strftime("%y-%m-%d-%H-%M-%S")
+    # print("started training vae at: " + start_time_str)
+    # print("finished training vae at: " + end_time_str)
+    # print("total vae training time: " + time_elapsed)
+    # print("saved last updated model at: " + save_model_path)
+    # print("=" * 60)
 
     ###################################### empowerment training ###################################### 
 
@@ -956,7 +960,7 @@ def train(args):
                                 s_t=dummy_states,
                                 z_t=dummy_latent,
                                 a_t=dummy_actions,
-                                y_t=dummy_states,
+                                y_t=dummy_controlled_variables,
                                 rtg_t=dummy_rtg,
                                 horizon=dummy_horizon,
                                 mask=dummy_mask,
@@ -987,15 +991,19 @@ def train(args):
         a_t = transitions.a_t  # (batch_size_per_device, context_len, action_dim)
         rtg_t = transitions.rtg_t  # (batch_size_per_device, context_len, 1)
         mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
-        
-        horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
+        s_tp1 = transitions.s_tp1  # (batch_size_per_device, context_len, state_dim)
 
-        s_tp1 = transitions.s_tp1
-        dummy_z_t = jnp.zeros((emp_batch_size_per_device, controlled_variables_dim))
+        horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
+        if args.trajectory_version:
+            y_t = transitions.s_tp1[...,controlled_variables]  # (batch_size_per_device, context_len, controlled_variables_dim)
+            dummy_z_t = jnp.zeros((emp_batch_size_per_device, context_len * controlled_variables_dim))
+        else:
+            y_t = jnp.take_along_axis(s_tp1, horizon[..., None]-1, axis=1)[...,controlled_variables]
+            dummy_z_t = jnp.zeros((emp_batch_size_per_device, controlled_variables_dim))
 
         emp_key, dropout_key = jax.random.split(key, 2)
 
-        loss = emp_model.apply(emp_params, ts, s_t, dummy_z_t, a_t, s_tp1, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, emp_key, rngs={'dropout': dropout_key})
+        loss = emp_model.apply(emp_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, emp_key, rngs={'dropout': dropout_key})
 
         return loss
 
@@ -1175,7 +1183,7 @@ if __name__ == "__main__":
     parser.add_argument('--dynamics_dropout_p', type=float, default=0.)
 
     parser.add_argument('--dynamics_batch_size', type=int, default=256)
-    parser.add_argument('--vae_batch_size', type=int, default=64)
+    parser.add_argument('--vae_batch_size', type=int, default=256)
     parser.add_argument('--emp_batch_size', type=int, default=256)
     parser.add_argument('--grad_updates_per_step', type=int, default=1)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -1186,7 +1194,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_updates_per_iter', type=int, default=100)
     parser.add_argument('--dynamics_save_iters', type=int, default=500)
     parser.add_argument('--vae_save_iters', type=int, default=100)
-    parser.add_argument('--emp_save_iters', type=int, default=500)
+    parser.add_argument('--emp_save_iters', type=int, default=100)
     parser.add_argument('--rm_normalization', action='store_true', help='Turn off input normalization')
 
     parser.add_argument('--max_devices_per_host', type=int, default=None)
@@ -1197,7 +1205,7 @@ if __name__ == "__main__":
     
     parser.add_argument('--resume_dynamics', action='store_true')
     parser.add_argument('--resume_vae', action='store_true')
-    parser.add_argument('--resume_start_time_str', type=str, default=None) # None, '25-06-25-16-17-25'
+    parser.add_argument('--resume_start_time_str', type=str, default='25-07-03-18-46-16') # None, '25-06-25-16-17-25'
 
     args = parser.parse_args()
 

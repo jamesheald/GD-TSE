@@ -667,7 +667,6 @@ class VAE(linen.Module):
 
         ###################### dynamics ###################### 
 
-        # multiple samples
         deterministic=True
         y_p = jax.vmap(dynamics_apply, in_axes=(0,None,None,None,None,None,None,None,None))(dynamics_params,
                                                                 ts,
@@ -677,8 +676,7 @@ class VAE(linen.Module):
                                                                 y_t,
                                                                 rtg_t,
                                                                 horizon,
-                                                                deterministic)#,
-                                                                # rngs={'dropout': key})
+                                                                deterministic)
 
         def true_fn(y_mean, y_log_std, y_t):
             dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
@@ -688,9 +686,10 @@ class VAE(linen.Module):
         min_log_std = -20.
         max_log_std = 2.
         y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
-        y_t = y_t[None].repeat(self.n_dynamics_ensembles,axis=0)
+        delta_y_t = y_t - s_t[:,:1,self.controlled_variables]
+        delta_y_t = y_t[None].repeat(self.n_dynamics_ensembles,axis=0)
         
-        y_log_probs = true_fn(y_mean, y_log_std, y_t)
+        y_log_probs = true_fn(y_mean, y_log_std, delta_y_t)
 
         ###################### loss ###################### 
 
@@ -714,6 +713,44 @@ class VAE(linen.Module):
 
         return kl_loss, a_decoder_loss, y_decoder_loss, disagreement_loss
     
+import distrax
+from flax.linen.initializers import zeros_init, ones_init, normal, orthogonal, constant
+class flow_model(linen.Module):
+    h_dims_conditioner: int
+    num_bijector_params: int
+    num_coupling_layers: int
+    z_dim: int
+
+    def setup(self):
+
+        # final linear layer of each conditioner initialised to zero so that the flow is initialised to the identity function
+        self.conditioners = [nn.Sequential([nn.Dense(features=self.h_dims_conditioner), nn.relu,\
+                                            nn.Dense(features=self.h_dims_conditioner), nn.relu,\
+                                            nn.Dense(features=self.num_bijector_params*self.z_dim, bias_init=constant(jnp.log(jnp.exp(1.)-1.)), kernel_init=zeros_init())])
+                             for layer_i in range(self.num_coupling_layers)]
+        
+    def __call__(self):
+
+        def make_flow():
+        
+            mask = jnp.arange(self.z_dim) % 2 # every second element is masked
+            mask = mask.astype(bool)
+
+            def bijector_fn(params):
+                shift, arg_soft_plus = jnp.split(params, 2, axis=-1)
+                return distrax.ScalarAffine(shift=shift-jnp.log(jnp.exp(1.)-1.), scale=jax.nn.softplus(arg_soft_plus)+1e-3)
+        
+            layers = []
+            for layer_i in range(self.num_coupling_layers):
+                layer = distrax.MaskedCoupling(mask=mask, bijector=bijector_fn, conditioner=self.conditioners[layer_i])
+                layers.append(layer)
+                mask = jnp.logical_not(mask) # flip mask after each layer
+            
+            # return distrax.Inverse(distrax.Chain(layers)) # invert the flow so that the `forward` method is called with `log_prob`
+            return distrax.Chain(layers)
+
+        return make_flow()
+
 class empowerment(linen.Module):
     state_dim: int
     act_dim: int
@@ -731,13 +768,19 @@ class empowerment(linen.Module):
         self.encoder = MLP(out_dim=self.controlled_variables_dim*2,
                            h_dims=[256,256])
 
+        self.flow = flow_model(h_dims_conditioner=256,
+                               num_bijector_params=2,
+                               num_coupling_layers=2,
+                               z_dim=self.controlled_variables_dim)
+
         
-        self.precoder = MLP(out_dim=self.act_dim,
-                            h_dims=[256,256])
+        self.precoder = AutonomousGRU(act_dim=self.act_dim,
+                                      context_len=self.context_len,
+                                      hidden_size=256)
 
     def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_apply, dynamics_params, key):
 
-        sample_z_key, sample_y_key = jax.random.split(key)
+        sample_z_key, sample_i_key, sample_y_key = jax.random.split(key, 3)
 
         ###################### sample from prior ###################### 
         
@@ -748,39 +791,57 @@ class empowerment(linen.Module):
 
         ###################### precode ###################### 
 
-        actions = jnp.tanh(self.precoder(jnp.concatenate([s_t[:, 0, :], z_samp], axis=-1)))
+        actions = self.precoder(s_t, z_t)
 
         ###################### sample controlled variable ###################### 
 
-        def get_mean_and_log_std(x, min_log_std = -20., max_log_std = 2.):
-            x_mean, x_log_std = jnp.split(x, 2, axis=-1)
-            x_log_std = jnp.clip(x_log_std, min_log_std, max_log_std)
-            return x_mean, x_log_std
+        deterministic=True
+        y_p = jax.vmap(dynamics_apply, in_axes=(0,None,None,None,None,None,None,None,None))(dynamics_params,
+                                                                ts,
+                                                                s_t,
+                                                                z_t,
+                                                                actions,
+                                                                y_t,
+                                                                rtg_t,
+                                                                horizon,
+                                                                deterministic)
 
-        def predict_next_state(dynamics_params, s_t, a_t, key):
-            key, dropout_key, sample_i_key, sample_s_key = jax.random.split(key, 4)
-            dropout_keys = jax.random.split(dropout_key, self.n_dynamics_ensembles)
-            s_dist_params = jax.vmap(dynamics_apply, in_axes=(0,None,None,0))(dynamics_params, s_t, a_t, dropout_keys)
-            s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
-            idx = jax.random.categorical(sample_i_key, jnp.ones(self.n_dynamics_ensembles), axis=-1)
-            s_dist = tfd.MultivariateNormalDiag(loc=s_mean[idx], scale_diag=jnp.exp(s_log_std[idx]))
-            delta_s = s_dist.sample(seed=sample_s_key)
-            stp1 = s_t + delta_s
-            return stp1
-        batch_predict_next_state = jax.vmap(predict_next_state, in_axes=(None,0,0,0))
-
-        batch_keys = jax.random.split(sample_y_key, s_t.shape[0])
-        stp1_samp = batch_predict_next_state(dynamics_params, s_t[:,0,:], actions, batch_keys)
-        y_samp = stp1_samp[...,self.controlled_variables]
+        y_mean, y_log_std = jnp.split(y_p, 2, axis=-1)
+        idx = jax.random.categorical(sample_i_key, jnp.ones(self.n_dynamics_ensembles), axis=-1)
+        min_log_std = -20.
+        max_log_std = 2.
+        y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
         
-        ###################### encode ###################### 
-        z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_samp], axis=-1))
+        # sample a dynamics model from ensemble
+        delta_y_dist = tfd.MultivariateNormalDiag(loc=y_mean[idx],
+                                                  scale_diag=jnp.exp(y_log_std[idx]))
+        delta_y = delta_y_dist.sample(seed=sample_y_key)
+        y_samp = s_t[:,:1,self.controlled_variables] + delta_y
+        z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_samp[:,0,:]], axis=-1))
+
+        # # use all dynamics models in ensemble
+        # delta_y_dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
+        # delta_y = delta_y_dist.sample(seed=sample_y_key)
+        # y_samp = s_t[:,:1,self.controlled_variables][None] + delta_y
+        # z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:][None].repeat(self.n_dynamics_ensembles, axis=0), y_samp[:,:,0,:]], axis=-1))
+
+        ###################### encode NF ###################### 
 
         z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
         min_log_std = -20.
         max_log_std = 2.
         z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
-        post_dist = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
+        base_post_dist = distrax.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
+        bijector = self.flow()
+        post_dist = distrax.Transformed(base_post_dist, bijector)
+            
+        ###################### encode MLP posterior ###################### 
+
+        # z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
+        # min_log_std = -20.
+        # max_log_std = 2.
+        # z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
+        # post_dist = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
 
         ###################### loss ###################### 
 
