@@ -37,7 +37,10 @@ class AutonomousGRU(nn.Module):
             initial_input = jnp.concatenate([s_t[0, :], z_t], axis=-1)
 
             # Map to initial hidden state
-            initial_carry = nn.Dense(self.hidden_size)(initial_input)
+            # initial_carry = nn.Dense(self.hidden_size)(initial_input)
+
+            initial_carry = MLP(out_dim=self.hidden_size,
+                                h_dims=[256,256])(initial_input)
 
             gru_cell = nn.GRUCell(features=self.hidden_size)
 
@@ -509,9 +512,11 @@ def make_transformer_networks(state_dim: int,
     dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
     if trajectory_version:
         dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
-        dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
     else:
         dummy_latent = jnp.zeros((batch_size, controlled_variables_dim))
+    if trajectory_version or transformer_type=='dynamics':
+        dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+    else:
         dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
     dummy_rtg = jnp.zeros((batch_size, context_len, 1))
     dummy_horizon = jnp.zeros((batch_size, 1), dtype=jnp.int32)
@@ -561,8 +566,13 @@ class VAE(linen.Module):
     drop_p: float
     n_dynamics_ensembles: int
     trajectory_version: bool = False
+    state_dependent_prior: bool = True
 
     def setup(self):
+
+        if self.state_dependent_prior:
+            self.prior = MLP(out_dim=self.controlled_variables_dim*2,
+                          h_dims=[256,256])
 
         # self.encoder = Transformer(state_dim=self.state_dim,
         #                             act_dim=self.act_dim,
@@ -605,7 +615,7 @@ class VAE(linen.Module):
 
         self.precoder = AutonomousGRU(act_dim=self.act_dim,
                                       context_len=self.context_len,
-                                      hidden_size=256)
+                                      hidden_size=512)
         
         # self.precoder = MLP(out_dim=self.act_dim,
                             # h_dims=[256,256])
@@ -652,7 +662,10 @@ class VAE(linen.Module):
         key, subkey = jax.random.split(key)
         
         ###################### encode ###################### 
-        z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_t[:,0,:]], axis=-1))
+
+        y_h = jnp.take_along_axis(y_t, horizon[..., None]-1, axis=1)
+
+        z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_h[:,0,:]], axis=-1))
         z_mean, z_log_std = get_mean_and_log_std(z_dist_params)
         dist_z_post = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
         z_t = dist_z_post.sample(seed=subkey)
@@ -686,15 +699,30 @@ class VAE(linen.Module):
         min_log_std = -20.
         max_log_std = 2.
         y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
-        delta_y_t = y_t - s_t[:,:1,self.controlled_variables]
-        delta_y_t = y_t[None].repeat(self.n_dynamics_ensembles,axis=0)
-        
+        delta_y_t = y_h - s_t[:,:1,self.controlled_variables]
+        delta_y_t = delta_y_t[None].repeat(self.n_dynamics_ensembles,axis=0)
+
+        y_mean = jnp.take_along_axis(y_mean, horizon[None, ..., None]-1, axis=2)
+        y_log_std = jnp.take_along_axis(y_log_std, horizon[None, ..., None]-1, axis=2)
+
         y_log_probs = true_fn(y_mean, y_log_std, delta_y_t)
 
         ###################### loss ###################### 
 
         # standard normal prior
-        dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_mean.shape), scale_diag=jnp.ones(z_log_std.shape))
+        if self.state_dependent_prior:
+
+            prior_params = self.prior(s_t[:,0,:])
+            prior_mean, prior_log_std = jnp.split(prior_params, 2, axis=-1)
+            min_log_std = -20.
+            max_log_std = 2.
+            prior_log_std = jnp.clip(prior_log_std, min_log_std, max_log_std)
+            dist_z_prior = tfd.MultivariateNormalDiag(loc=prior_mean, scale_diag=jnp.exp(prior_log_std))
+
+        else:
+            
+            dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_mean.shape), scale_diag=jnp.ones(z_log_std.shape))
+        
         kl_loss = tfd.kl_divergence(dist_z_post, dist_z_prior).mean()
 
         y_log_probs_mixture = jax.nn.logsumexp(y_log_probs, b=1/self.n_dynamics_ensembles, axis=0)
@@ -706,9 +734,9 @@ class VAE(linen.Module):
         a_decoder_loss = jnp.sum(a_mse * valid_mask) / a_shape[0]
 
         # normalize
-        kl_loss /= self.act_dim
+        kl_loss /= self.controlled_variables_dim
         a_decoder_loss /= self.act_dim
-        y_decoder_loss /= self.act_dim
+        y_decoder_loss /= self.controlled_variables_dim
         disagreement_loss = 0.
 
         return kl_loss, a_decoder_loss, y_decoder_loss, disagreement_loss
@@ -763,55 +791,91 @@ class empowerment(linen.Module):
     n_heads: int
     drop_p: float
     n_dynamics_ensembles: int
+    alternate_training: bool = False
+    sample_one_model: bool = True
+    use_flow: bool = False
+    state_dependent_source: bool = True
 
     def setup(self):
 
-        self.encoder = MLP(out_dim=self.controlled_variables_dim*2,
-                           h_dims=[256,256])
-
-        dummy_s_t = jnp.zeros((1,self.state_dim))
-        dummy_y_t = jnp.zeros((1,self.controlled_variables_dim))
-        _ = self.encoder( jnp.concatenate([dummy_s_t, dummy_y_t], axis=-1))
-
-        self.flow = flow_model(h_dims_conditioner=256,
-                               num_bijector_params=2,
-                               num_coupling_layers=2,
-                               z_dim=self.controlled_variables_dim)
-
+        if self.state_dependent_source:
+            self.prior = MLP(out_dim=self.controlled_variables_dim*2,
+                          h_dims=[256,256])
         
         self.precoder = AutonomousGRU(act_dim=self.act_dim,
                                       context_len=self.context_len,
-                                      hidden_size=256)
+                                      hidden_size=512)
 
-        dummy_s_t = jnp.zeros((1,self.context_len,self.state_dim))
-        dummy_z_t = jnp.zeros((1,self.controlled_variables_dim))
-        _ = self.precoder(dummy_s_t, dummy_z_t)
+        if self.alternate_training:
+            dummy_s_t = jnp.zeros((1,self.context_len,self.state_dim))
+            dummy_z_t = jnp.zeros((1,self.controlled_variables_dim))
+            _ = self.precoder(dummy_s_t, dummy_z_t)
+
+        self.encoder = MLP(out_dim=self.controlled_variables_dim*2,
+                    h_dims=[256,256])
+        
+        if self.alternate_training:
+            dummy_s_t = jnp.zeros((1,self.state_dim))
+            dummy_y_t = jnp.zeros((1,self.controlled_variables_dim))
+            _ = self.encoder(jnp.concatenate([dummy_s_t, dummy_y_t], axis=-1))
+
+        if self.use_flow:
+            self.flow = flow_model(h_dims_conditioner=256,
+                                num_bijector_params=2,
+                                num_coupling_layers=2,
+                                z_dim=self.controlled_variables_dim)
 
     def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, train_precoder, dynamics_apply, dynamics_params, key):
 
         sample_z_key, sample_i_key, sample_y_key = jax.random.split(key, 3)
 
-        ###################### sample from prior ###################### 
-        
-        dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_t.shape), scale_diag=jnp.ones(z_t.shape))
-        # sample_z_keys = jax.random.split(sample_z_key, s_t.shape[0])
-        # z_samp = jax.vmap(dist_z_prior.sample)(seed=sample_z_keys)
-        z_samp = dist_z_prior.sample(seed=sample_z_key)
+        ###################### sample from aggregate posterior (state-dependent prior) ###################### 
+
+        # z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_t[:,0,:]], axis=-1))
+        # z_mean, z_log_std = jnp.split(jax.lax.stop_gradient(z_dist_params), 2, axis=-1)
+        # min_log_std = -20.
+        # max_log_std = 2.
+        # z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
+        # post_dist = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
+        # z_samp = dist_z_prior.sample(seed=sample_z_key)
+
+        ###################### state-dependent prior ###################### 
+
+        if self.state_dependent_source:
+
+            source_params = self.prior(s_t[:,0,:])
+            source_mean, source_log_std = jnp.split(source_params, 2, axis=-1)
+            min_log_std = -20.
+            max_log_std = 2.
+            source_log_std = jnp.clip(source_log_std, min_log_std, max_log_std)
+            source_dist = tfd.MultivariateNormalDiag(loc=source_mean, scale_diag=jnp.exp(source_log_std))
+            z_samp = source_dist.sample(seed=sample_z_key)
+
+        else:
+
+            dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_t.shape), scale_diag=jnp.ones(z_t.shape))
+            # sample_z_keys = jax.random.split(sample_z_key, s_t.shape[0])
+            # z_samp = jax.vmap(dist_z_prior.sample)(seed=sample_z_keys)
+            z_samp = dist_z_prior.sample(seed=sample_z_key)
 
         ###################### precode ###################### 
 
-        precoder_apply = self.precoder.apply
+        if self.alternate_training:
 
-        def apply_with_grad(precoder_params, s_t, z_t):
-            return precoder_apply({'params': precoder_params}, s_t, z_t)
+            precoder_apply = self.precoder.apply
+            def apply_with_grad(precoder_params, s_t, z_t):
+                return precoder_apply({'params': precoder_params}, s_t, z_t)
 
-        def apply_without_grad(precoder_params, s_t, z_t):
-            return precoder_apply({'params': jax.lax.stop_gradient(precoder_params)}, s_t, z_t)
+            def apply_without_grad(precoder_params, s_t, z_t):
+                return precoder_apply({'params': jax.lax.stop_gradient(precoder_params)}, s_t, z_t)
+            actions = jax.lax.cond(train_precoder,
+                                apply_with_grad,
+                                apply_without_grad,
+                                self.variables['params']['precoder'], s_t, z_t)
+            
+        else:
 
-        actions = jax.lax.cond(train_precoder,
-                            apply_with_grad,
-                            apply_without_grad,
-                            self.variables['params']['precoder'], s_t, z_t)
+            actions = self.precoder(s_t, z_t)
 
         ###################### sample controlled variable ###################### 
 
@@ -831,57 +895,71 @@ class empowerment(linen.Module):
         min_log_std = -20.
         max_log_std = 2.
         y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
+
+        y_mean = jnp.take_along_axis(y_mean, horizon[None, ..., None]-1, axis=2)
+        y_log_std = jnp.take_along_axis(y_log_std, horizon[None, ..., None]-1, axis=2)
         
-        # sample a dynamics model from ensemble
-        delta_y_dist = tfd.MultivariateNormalDiag(loc=y_mean[idx],
-                                                  scale_diag=jnp.exp(y_log_std[idx]))
-        delta_y = delta_y_dist.sample(seed=sample_y_key)
-        y_samp = s_t[:,:1,self.controlled_variables] + delta_y
+        if self.sample_one_model:
 
-        encoder_apply = self.encoder.apply
+            # sample a dynamics model from ensemble
+            delta_y_dist = tfd.MultivariateNormalDiag(loc=y_mean[idx],
+                                                    scale_diag=jnp.exp(y_log_std[idx]))
+            delta_y = delta_y_dist.sample(seed=sample_y_key)
+            y_samp = s_t[:,:1,self.controlled_variables] + delta_y
+        
+        else:
 
-        def apply_encoder_with_grad(encoder_params, s_t_y_samp):
-            return encoder_apply({'params': encoder_params}, s_t_y_samp)
+            # use all dynamics models in ensemble
+            delta_y_dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
+            delta_y = delta_y_dist.sample(seed=sample_y_key)
+            y_samp = s_t[:,:1,self.controlled_variables][None] + delta_y
+            z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:][None].repeat(self.n_dynamics_ensembles, axis=0), y_samp[:,:,0,:]], axis=-1))
 
-        def apply_encoder_without_grad(encoder_params, s_t_y_samp):
-            return encoder_apply({'params': jax.lax.stop_gradient(encoder_params)}, s_t_y_samp)
 
-        z_dist_params = jax.lax.cond(train_precoder,
-                            apply_encoder_without_grad,
-                            apply_encoder_with_grad,
-                            self.variables['params']['encoder'], jnp.concatenate([s_t[:,0,:], y_samp[:,0,:]], axis=-1))
+        if self.alternate_training:
 
-        # # use all dynamics models in ensemble
-        # delta_y_dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
-        # delta_y = delta_y_dist.sample(seed=sample_y_key)
-        # y_samp = s_t[:,:1,self.controlled_variables][None] + delta_y
-        # z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:][None].repeat(self.n_dynamics_ensembles, axis=0), y_samp[:,:,0,:]], axis=-1))
+            encoder_apply = self.encoder.apply
+            def apply_encoder_with_grad(encoder_params, s_t_y_samp):
+                return encoder_apply({'params': encoder_params}, s_t_y_samp)
+
+            def apply_encoder_without_grad(encoder_params, s_t_y_samp):
+                return encoder_apply({'params': jax.lax.stop_gradient(encoder_params)}, s_t_y_samp)
+            z_dist_params = jax.lax.cond(train_precoder,
+                                apply_encoder_without_grad,
+                                apply_encoder_with_grad,
+                                self.variables['params']['encoder'], jnp.concatenate([s_t[:,0,:], y_samp[:,0,:]], axis=-1))
+
+        else:
+
+            z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_samp[:,0,:]], axis=-1))
 
         ###################### encode NF ###################### 
 
-        # z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
-        # min_log_std = -20.
-        # max_log_std = 2.
-        # z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
-        # base_post_dist = distrax.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
-        # bijector = self.flow()
-        # post_dist = distrax.Transformed(base_post_dist, bijector)
-            
-        ###################### encode MLP posterior ###################### 
+        if self.use_flow:
 
-        # here i clip the variance of the posterior to 1, as it was 1 in the prior
-        # and the posterior variance should be less than the prior
-        z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
-        min_log_std = -20.
-        max_log_std = 0.
-        z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
-        post_dist = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
+            z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
+            min_log_std = -20.
+            max_log_std = 2.
+            z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
+            base_post_dist = distrax.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
+            bijector = self.flow()
+            post_dist = distrax.Transformed(base_post_dist, bijector)
+            
+        else:
+
+            # here i clip the variance of the posterior to 1, as it was 1 in the prior
+            # and the posterior variance should be less than the prior
+            z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
+            min_log_std = -20.
+            max_log_std = 2.
+            z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
+            post_dist = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
 
         ###################### loss ###################### 
 
         log_prob_z = post_dist.log_prob(z_samp)
 
-        loss = -jnp.mean(log_prob_z)
+        loss = -jnp.mean(log_prob_z + source_dist.entropy())
 
         loss /= z_samp.shape[-1]
         
