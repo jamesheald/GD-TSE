@@ -316,17 +316,23 @@ def train(args):
 
     if args.resume_start_time_str is None:
 
-        dynamics_model = make_transformer_networks(
+        # dynamics_model = make_transformer_networks(
+        #     state_dim=obs_dim,
+        #     act_dim=act_dim,
+        #     controlled_variables_dim=controlled_variables_dim,
+        #     n_blocks=n_blocks,
+        #     h_dim=embed_dim,
+        #     context_len=context_len,
+        #     n_heads=n_heads,
+        #     drop_p=args.dynamics_dropout_p,
+        #     trajectory_version=args.trajectory_version,
+        #     transformer_type='dynamics'
+        # )
+
+        dynamics_model = dynamics(
+            h_dims_dynamics=args.h_dims_dynamics,
             state_dim=obs_dim,
-            act_dim=act_dim,
-            controlled_variables_dim=controlled_variables_dim,
-            n_blocks=n_blocks,
-            h_dim=embed_dim,
-            context_len=context_len,
-            n_heads=n_heads,
-            drop_p=args.dynamics_dropout_p,
-            trajectory_version=args.trajectory_version,
-            transformer_type='dynamics'
+            drop_out_rates=args.dynamics_dropout_rates
         )
 
         schedule_fn = optax.polynomial_schedule(
@@ -342,14 +348,14 @@ def train(args):
         )
 
         # batch_size = 1
-        # dummy_states = jnp.zeros((batch_size, obs_dim))
-        # dummy_actions = jnp.zeros((batch_size, act_dim))
+        dummy_states = jnp.zeros((batch_size, obs_dim))
+        dummy_actions = jnp.zeros((batch_size, act_dim))
         key_params, key_dropout, key = jax.random.split(global_key, 3)
         dynamics_params_list = []
         # create ensemble of dynamics models
         for i in range(args.n_dynamics_ensembles):
-            dynamics_params_list.append(dynamics_model.init({'params': key_params, 'dropout': key_dropout}))
-            # dynamics_params_list.append(dynamics_model.init({'params': key_params}, dummy_states, dummy_actions, key_dropout))
+            # dynamics_params_list.append(dynamics_model.init({'params': key_params, 'dropout': key_dropout}))
+            dynamics_params_list.append(dynamics_model.init({'params': key_params}, dummy_states, dummy_actions, key_dropout))
             key_params, key_dropout, key = jax.random.split(key, 3)
 
         dynamics_params = jax.tree_util.tree_map(lambda *p: jnp.stack(p), *dynamics_params_list)
@@ -378,51 +384,63 @@ def train(args):
             rtg_t = transitions.rtg_t  # (batch_size_per_device, context_len, 1)
             mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
 
-            horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
-            y_t = transitions.s_tp1[...,controlled_variables]  # (batch_size_per_device, context_len, controlled_variables_dim)
-            if args.trajectory_version:
-                # y_t = transitions.s_tp1[...,controlled_variables]  # (batch_size_per_device, context_len, controlled_variables_dim)
-                dummy_z_t = jnp.zeros((dynamics_batch_size_per_device, context_len * controlled_variables_dim))
-            else:
-                # y_t = jnp.take_along_axis(s_tp1, horizon[..., None]-1, axis=1)[...,controlled_variables]
-                dummy_z_t = jnp.zeros((dynamics_batch_size_per_device, controlled_variables_dim))
-
-            y_p = dynamics_model.apply(dynamics_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, deterministic=True, rngs={'dropout': key})
-
-            def true_fn(y_mean, y_log_std, y_t):
-                dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
-                return dist.log_prob(y_t)
-
-            def false_fn(y_mean, y_log_std, y_t):
-                return 0.
-            
-            def get_log_prob(mask, y_mean, y_log_std, y_t):
-                log_prob = jax.lax.cond(mask, true_fn, false_fn, y_mean, y_log_std, y_t)
-                return log_prob
-            batch_get_log_prob = jax.vmap(get_log_prob)
-
-            y_mean, y_log_std = jnp.split(y_p, 2, axis=-1)
-            min_log_std = -20.
-            max_log_std = 2.
-            y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
-            y_mean = y_mean.reshape(-1, controlled_variables_dim)
-            y_log_std = y_log_std.reshape(-1, controlled_variables_dim)
-            delta_y_t = y_t - s_t[:,:1,controlled_variables]
-            delta_y_t = delta_y_t.reshape(-1, controlled_variables_dim)
-            
+            # horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
+            # y_t = transitions.s_tp1[...,controlled_variables]  # (batch_size_per_device, context_len, controlled_variables_dim)
             # if args.trajectory_version:
-            #     valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
-            #     log_probs = batch_get_log_prob(valid_mask, y_mean, y_log_std, delta_y_t)
-            #     loss = jnp.sum(-log_probs * valid_mask) / jnp.sum(valid_mask)
+            #     # y_t = transitions.s_tp1[...,controlled_variables]  # (batch_size_per_device, context_len, controlled_variables_dim)
+            #     dummy_z_t = jnp.zeros((dynamics_batch_size_per_device, context_len * controlled_variables_dim))
             # else:
-            #     log_probs = jax.vmap(true_fn)(y_mean, y_log_std, delta_y_t)
-            #     loss = jnp.mean(-log_probs)
+            #     # y_t = jnp.take_along_axis(s_tp1, horizon[..., None]-1, axis=1)[...,controlled_variables]
+            #     dummy_z_t = jnp.zeros((dynamics_batch_size_per_device, controlled_variables_dim))
 
-            valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
-            log_probs = batch_get_log_prob(valid_mask, y_mean, y_log_std, delta_y_t)
-            loss = jnp.sum(-log_probs * valid_mask) / jnp.sum(valid_mask)
+            # y_p = dynamics_model.apply(dynamics_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, deterministic=True, rngs={'dropout': key})
 
-            loss /= controlled_variables_dim
+            # def true_fn(y_mean, y_log_std, y_t):
+            #     dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
+            #     return dist.log_prob(y_t)
+
+            # def false_fn(y_mean, y_log_std, y_t):
+            #     return 0.
+            
+            # def get_log_prob(mask, y_mean, y_log_std, y_t):
+            #     log_prob = jax.lax.cond(mask, true_fn, false_fn, y_mean, y_log_std, y_t)
+            #     return log_prob
+            # batch_get_log_prob = jax.vmap(get_log_prob)
+
+            # y_mean, y_log_std = jnp.split(y_p, 2, axis=-1)
+            # min_log_std = -20.
+            # max_log_std = 2.
+            # y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
+            # y_mean = y_mean.reshape(-1, controlled_variables_dim)
+            # y_log_std = y_log_std.reshape(-1, controlled_variables_dim)
+            # delta_y_t = y_t - s_t[:,:1,controlled_variables]
+            # delta_y_t = delta_y_t.reshape(-1, controlled_variables_dim)
+            
+            # # if args.trajectory_version:
+            # #     valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
+            # #     log_probs = batch_get_log_prob(valid_mask, y_mean, y_log_std, delta_y_t)
+            # #     loss = jnp.sum(-log_probs * valid_mask) / jnp.sum(valid_mask)
+            # # else:
+            # #     log_probs = jax.vmap(true_fn)(y_mean, y_log_std, delta_y_t)
+            # #     loss = jnp.mean(-log_probs)
+
+            # valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
+            # log_probs = batch_get_log_prob(valid_mask, y_mean, y_log_std, delta_y_t)
+            # loss = jnp.sum(-log_probs * valid_mask) / jnp.sum(valid_mask)
+
+            # loss /= controlled_variables_dim
+
+            s_p = dynamics_model.apply(dynamics_params, s_t, a_t, key)
+            s_mean, s_log_std = jnp.split(s_p, 2, axis=-1)
+            min_log_std = -20.
+            max_log_std = 2. 
+            s_log_std = jnp.clip(s_log_std, min_log_std, max_log_std)
+
+            dist = tfd.MultivariateNormalDiag(loc=s_mean, scale_diag=jnp.exp(s_log_std))
+            delta_s = s_tp1-s_t
+            log_probs = dist.log_prob(delta_s)
+            loss = jnp.mean(-log_probs)
+            loss /= obs_dim 
 
             return loss 
 
@@ -476,7 +494,8 @@ def train(args):
 
             def dynamic_slice_context(carry, x):
                 traj, c_idx = x
-                return (), jax.lax.dynamic_slice(traj, (c_idx, 0), (context_len, trans_dim))
+                dynamics_context_len = 1
+                return (), jax.lax.dynamic_slice(traj, (c_idx, 0), (dynamics_context_len, trans_dim))
 
             # (batch_size_per_device*num_updates_per_iter, max_epi_len + context_len, trans_dim)
             transitions = jnp.take(replay_buffer.data, epi_idx, axis=0, mode='clip')
@@ -589,17 +608,23 @@ def train(args):
         load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
         _dynamics_params = load_params(load_current_model_path)
 
-        dynamics_model = make_transformer_networks(
+        # dynamics_model = make_transformer_networks(
+        #     state_dim=obs_dim,
+        #     act_dim=act_dim,
+        #     controlled_variables_dim=controlled_variables_dim,
+        #     n_blocks=n_blocks,
+        #     h_dim=embed_dim,
+        #     context_len=context_len,
+        #     n_heads=n_heads,
+        #     drop_p=args.dynamics_dropout_p,
+        #     trajectory_version=args.trajectory_version,
+        #     transformer_type='dynamics'
+        # )
+
+        dynamics_model = dynamics(
+            h_dims_dynamics=args.h_dims_dynamics,
             state_dim=obs_dim,
-            act_dim=act_dim,
-            controlled_variables_dim=controlled_variables_dim,
-            n_blocks=n_blocks,
-            h_dim=embed_dim,
-            context_len=context_len,
-            n_heads=n_heads,
-            drop_p=args.dynamics_dropout_p,
-            trajectory_version=args.trajectory_version,
-            transformer_type='dynamics'
+            drop_out_rates=args.dynamics_dropout_rates
         )
 
         wandb.init(
@@ -1226,7 +1251,7 @@ if __name__ == "__main__":
     parser.add_argument('--dynamics_dropout_rates', type=List, default=[0., 0.])
     parser.add_argument('--dynamics_dropout_p', type=float, default=0.)
 
-    parser.add_argument('--dynamics_batch_size', type=int, default=256)
+    parser.add_argument('--dynamics_batch_size', type=int, default=2048)
     parser.add_argument('--vae_batch_size', type=int, default=256)
     parser.add_argument('--emp_batch_size', type=int, default=256)
     parser.add_argument('--grad_updates_per_step', type=int, default=1)
@@ -1249,7 +1274,7 @@ if __name__ == "__main__":
     
     parser.add_argument('--resume_dynamics', action='store_true')
     parser.add_argument('--resume_vae', action='store_true')
-    parser.add_argument('--resume_start_time_str', type=str, default='25-07-06-13-08-32') # None, '25-06-25-16-17-25'
+    parser.add_argument('--resume_start_time_str', type=str, default='25-07-06-18-27-39') # None, '25-06-25-16-17-25'
 
     args = parser.parse_args()
 
