@@ -285,8 +285,12 @@ def train(args):
 
         # sample from prior
         z_t = dist_z_prior.sample(seed=key)
-        
         actions = jax.jit(eval_precoder.apply)(precoder_params, target_agnostic_obs[None,None, :], z_t)
+
+        # target_obs = np.zeros(3)
+        # y_h = target_obs - obs[33:36]
+        # y_h = (y_h - obs_mean[36:]) / obs_std[36:]
+        # actions = jax.jit(eval_precoder.apply)(precoder_params, target_agnostic_obs[None,None, :], y_h[None])
 
         return actions[0,:,:]
     

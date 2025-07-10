@@ -679,6 +679,7 @@ class VAE(linen.Module):
         a_shape = a_t.shape
 
         actions = self.precoder(s_t, z_t)
+        # actions = self.precoder(s_t, y_h[:,0,:])
 
         a_mse = 0.5 * ((actions - a_t)**2).sum(axis=-1).reshape(-1)
 
