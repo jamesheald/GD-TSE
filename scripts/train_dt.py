@@ -416,7 +416,18 @@ def train(args):
 
     ###################################### dynamics training ###################################### 
 
-    if args.resume_start_time_str is None:
+    dynamics_model = dynamics(
+        h_dims_dynamics=args.h_dims_dynamics,
+        state_dim=obs_dim,
+        drop_out_rates=args.dynamics_dropout_rates
+    )
+
+    if args.resume_start_time_str is not None and args.resume_dynamics is False:
+
+        total_updates = 300000
+        load_model_path = os.path.join(log_dir, "dynamics_model.pt")
+        load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
+        _dynamics_params = load_params(load_current_model_path)
 
         # dynamics_model = make_transformer_networks(
         #     state_dim=obs_dim,
@@ -431,43 +442,73 @@ def train(args):
         #     transformer_type='dynamics'
         # )
 
-        dynamics_model = dynamics(
-            h_dims_dynamics=args.h_dims_dynamics,
-            state_dim=obs_dim,
-            drop_out_rates=args.dynamics_dropout_rates
-        )
+        wandb.init(
+                name=f'{env_d4rl_name}-{random.randint(int(1e5), int(1e6) - 1)}',
+                group=env_d4rl_name,
+                project='jax_dt',
+                config=args
+            )
 
-        schedule_fn = optax.polynomial_schedule(
-            init_value=lr * 1 / warmup_steps,
-            end_value=lr,
-            power=1,
-            transition_steps=warmup_steps,
-            transition_begin=0
-        )
-        dynamics_optimizer = optax.chain(
-            optax.clip(args.gradient_clipping),
-            optax.adamw(learning_rate=schedule_fn, weight_decay=wt_decay),
-        )
+    else:
 
-        # batch_size = 1
-        dummy_states = jnp.zeros((batch_size, obs_dim))
-        dummy_actions = jnp.zeros((batch_size, act_dim))
-        s_tm1_s_t = jnp.concatenate([dummy_states, dummy_states], axis=-1)
-        key_params, key_dropout, key = jax.random.split(global_key, 3)
-        dynamics_params_list = []
-        # create ensemble of dynamics models
-        for i in range(args.n_dynamics_ensembles):
-            # dynamics_params_list.append(dynamics_model.init({'params': key_params, 'dropout': key_dropout}))
-            dynamics_params_list.append(dynamics_model.init({'params': key_params}, s_tm1_s_t, dummy_actions, key_dropout))
-            key_params, key_dropout, key = jax.random.split(key, 3)
+        if args.resume_start_time_str is None or args.resume_dynamics is False:
 
-        dynamics_params = jax.tree_util.tree_map(lambda *p: jnp.stack(p), *dynamics_params_list)
+            # dynamics_model = make_transformer_networks(
+            #     state_dim=obs_dim,
+            #     act_dim=act_dim,
+            #     controlled_variables_dim=controlled_variables_dim,
+            #     n_blocks=n_blocks,
+            #     h_dim=embed_dim,
+            #     context_len=context_len,
+            #     n_heads=n_heads,
+            #     drop_p=args.dynamics_dropout_p,
+            #     trajectory_version=args.trajectory_version,
+            #     transformer_type='dynamics'
+            # )
+
+            schedule_fn = optax.polynomial_schedule(
+                init_value=lr * 1 / warmup_steps,
+                end_value=lr,
+                power=1,
+                transition_steps=warmup_steps,
+                transition_begin=0
+            )
+            dynamics_optimizer = optax.chain(
+                optax.clip(args.gradient_clipping),
+                optax.adamw(learning_rate=schedule_fn, weight_decay=wt_decay),
+            )
+
+            # batch_size = 1
+            dummy_states = jnp.zeros((batch_size, obs_dim))
+            dummy_actions = jnp.zeros((batch_size, act_dim))
+            s_tm1_s_t = jnp.concatenate([dummy_states, dummy_states], axis=-1)
+            key_params, key_dropout, key = jax.random.split(global_key, 3)
+            dynamics_params_list = []
+            # create ensemble of dynamics models
+            for i in range(args.n_dynamics_ensembles):
+                # dynamics_params_list.append(dynamics_model.init({'params': key_params, 'dropout': key_dropout}))
+                dynamics_params_list.append(dynamics_model.init({'params': key_params}, s_tm1_s_t, dummy_actions, key_dropout))
+                key_params, key_dropout, key = jax.random.split(key, 3)
+
+            dynamics_params = jax.tree_util.tree_map(lambda *p: jnp.stack(p), *dynamics_params_list)
+
+        elif args.resume_start_time_str is not None or args.resume_dynamics is True:
+
+            dynamics_optimizer = optax.chain(
+                optax.clip(args.gradient_clipping),
+                optax.adamw(learning_rate=lr, weight_decay=wt_decay),
+            )
+
+            total_updates = 300000
+            load_model_path = os.path.join(log_dir, "dynamics_model.pt")
+            load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
+            dynamics_params = load_params(load_current_model_path)
 
         dynamics_optimizer_state = jax.vmap(dynamics_optimizer.init)(dynamics_params)
 
         # count the number of parameters
-        param_count = sum(x.size for x in jax.tree_util.tree_leaves(dynamics_params_list[0]))
-        print(f'num_dynamics_param: {param_count}')
+        # param_count = sum(x.size for x in jax.tree_util.tree_leaves(dynamics_params_list[0]))
+        # print(f'num_dynamics_param: {param_count}')
 
         dynamics_optimizer_state, dynamics_params = bcast_local_devices(
             (dynamics_optimizer_state, dynamics_params), local_devices_to_use)
@@ -705,39 +746,6 @@ def train(args):
         print("total dynamics training time: " + time_elapsed)
         print("saved last updated model at: " + save_model_path)
         print("=" * 60)
-
-    else:
-
-        total_updates = 300000
-        load_model_path = os.path.join(log_dir, "dynamics_model.pt")
-        load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
-        _dynamics_params = load_params(load_current_model_path)
-
-        # dynamics_model = make_transformer_networks(
-        #     state_dim=obs_dim,
-        #     act_dim=act_dim,
-        #     controlled_variables_dim=controlled_variables_dim,
-        #     n_blocks=n_blocks,
-        #     h_dim=embed_dim,
-        #     context_len=context_len,
-        #     n_heads=n_heads,
-        #     drop_p=args.dynamics_dropout_p,
-        #     trajectory_version=args.trajectory_version,
-        #     transformer_type='dynamics'
-        # )
-
-        dynamics_model = dynamics(
-            h_dims_dynamics=args.h_dims_dynamics,
-            state_dim=obs_dim,
-            drop_out_rates=args.dynamics_dropout_rates
-        )
-
-        wandb.init(
-                name=f'{env_d4rl_name}-{random.randint(int(1e5), int(1e6) - 1)}',
-                group=env_d4rl_name,
-                project='jax_dt',
-                config=args
-            )
         
         # cumsum_dims = np.cumsum([state_dim, act_dim, state_dim])
         # ep=0
