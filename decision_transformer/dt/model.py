@@ -37,10 +37,10 @@ class AutonomousGRU(nn.Module):
             initial_input = jnp.concatenate([s_t[0, :], z_t], axis=-1)
 
             # Map to initial hidden state
-            # initial_carry = nn.Dense(self.hidden_size)(initial_input)
+            initial_carry = nn.Dense(self.hidden_size)(initial_input)
 
-            initial_carry = MLP(out_dim=self.hidden_size,
-                                h_dims=[256,256])(initial_input)
+            # initial_carry = MLP(out_dim=self.hidden_size,
+            #                     h_dims=[256,256])(initial_input)
 
             gru_cell = nn.GRUCell(features=self.hidden_size)
 
@@ -566,7 +566,8 @@ class VAE(linen.Module):
     drop_p: float
     n_dynamics_ensembles: int
     trajectory_version: bool = False
-    state_dependent_prior: bool = True
+    state_dependent_prior: bool = False
+    state_dependent_encoder: bool = False
 
     def setup(self):
 
@@ -615,7 +616,7 @@ class VAE(linen.Module):
 
         self.precoder = AutonomousGRU(act_dim=self.act_dim,
                                       context_len=self.context_len,
-                                      hidden_size=512)
+                                      hidden_size=128)
         
         # self.precoder = MLP(out_dim=self.act_dim,
                             # h_dims=[256,256])
@@ -665,7 +666,10 @@ class VAE(linen.Module):
 
         y_h = jnp.take_along_axis(y_t, horizon[..., None]-1, axis=1)
 
-        z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_h[:,0,:]], axis=-1))
+        if self.state_dependent_encoder:
+            z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_h[:,0,:]], axis=-1))
+        else:
+            z_dist_params = self.encoder(y_h[:,0,:])
         z_mean, z_log_std = get_mean_and_log_std(z_dist_params)
         dist_z_post = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
         z_t = dist_z_post.sample(seed=subkey)
@@ -676,7 +680,7 @@ class VAE(linen.Module):
 
         actions = self.precoder(s_t, z_t)
 
-        a_mse = ((actions - a_t)**2).sum(axis=-1).reshape(-1)
+        a_mse = 0.5 * ((actions - a_t)**2).sum(axis=-1).reshape(-1)
 
         ###################### Markov dynamics ###################### 
 
@@ -699,32 +703,38 @@ class VAE(linen.Module):
                 s_dist = tfd.MultivariateNormalDiag(loc=s_mean[idx], scale_diag=jnp.exp(s_log_std[idx]))
 
                 delta_s = s_dist.sample(seed=sample_s_key)
-                next_state = state + delta_s
+                # next_state = state + delta_s
+                s_curr = state[...,self.state_dim:]
+                s_next = s_curr + delta_s
+
+                next_state = jnp.concatenate([s_curr, s_next], axis=-1)
+
                 carry = next_state, key, dynamics_params
-                return carry, (s_dist_params, disagreement)
+                return carry, (s_curr, s_dist_params, disagreement)
 
             carry = state, key, dynamics_params
-            _, (s_dist_params, disagreement) = jax.lax.scan(step_fn, carry, actions)
+            _, (s_curr, s_dist_params, disagreement) = jax.lax.scan(step_fn, carry, actions)
             
-            return s_dist_params, disagreement
+            return s_curr, s_dist_params, disagreement
         
         batch_peform_rollout = jax.vmap(peform_rollout, in_axes=(0,0,0,None))
 
         dynamics_keys = jax.random.split(key, actions.shape[0])
-        s_dist_params, disagreement = batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions, dynamics_params)
+        s_samp, s_dist_params, disagreement = batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions, dynamics_params)
 
         s_mean, s_log_std = jnp.split(s_dist_params, 2, axis=-1)
         min_log_std = -20.
         max_log_std = 2.
         s_log_std = jnp.clip(s_log_std, min_log_std, max_log_std)
-        delta_y_t = y_h - s_t[:,:1,self.controlled_variables]
-        delta_y_t = delta_y_t[:,:,None,:].repeat(self.n_dynamics_ensembles,axis=2)
 
+        s_samp = jnp.take_along_axis(s_samp, horizon[..., None]-1, axis=1)[:,:,None,self.controlled_variables]
         s_mean = jnp.take_along_axis(s_mean, horizon[..., None, None]-1, axis=1)[...,self.controlled_variables]
         s_log_std = jnp.take_along_axis(s_log_std, horizon[..., None, None]-1, axis=1)[...,self.controlled_variables]
 
-        y_dist = tfd.MultivariateNormalDiag(loc=s_mean, scale_diag=jnp.exp(s_log_std))
-        y_log_probs = y_dist.log_prob(delta_y_t)
+        y_dist = tfd.MultivariateNormalDiag(loc=s_samp + s_mean, scale_diag=jnp.exp(s_log_std))
+        y_log_probs = y_dist.log_prob(y_h[:,:,None,:].repeat(self.n_dynamics_ensembles,axis=2))
+
+        # y_mse = 0.5 * ((s_samp + s_mean - y_h[:,:,None,:].repeat(self.n_dynamics_ensembles,axis=2))**2).sum(axis=-1)
 
         ###################### dynamics ###################### 
 
@@ -775,6 +785,9 @@ class VAE(linen.Module):
 
         y_log_probs_mixture = jax.nn.logsumexp(y_log_probs, b=1/self.n_dynamics_ensembles, axis=2)
         y_decoder_loss = -y_log_probs_mixture.mean()
+
+        # y_mse_mixture = jax.nn.logsumexp(y_mse, b=1/self.n_dynamics_ensembles, axis=2)
+        # y_decoder_loss = y_mse_mixture.mean()
 
         valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
 
@@ -855,7 +868,7 @@ class empowerment(linen.Module):
         
         self.precoder = AutonomousGRU(act_dim=self.act_dim,
                                       context_len=self.context_len,
-                                      hidden_size=512)
+                                      hidden_size=128)
 
         if self.alternate_training:
             dummy_s_t = jnp.zeros((1,self.context_len,self.state_dim))

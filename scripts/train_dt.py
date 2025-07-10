@@ -145,6 +145,7 @@ def train(args):
 
     minari_dataset = minari.load_dataset('D4RL/relocate/expert-v2')
     minari_env = minari_dataset.recover_environment(render_mode='rgb_array')
+    learned_minari_env = minari_dataset.recover_environment(render_mode='rgb_array')
 
     # make hand and ball position relative to initial position of hand
     target_agnostic_minari_dataset = [replace(episode,
@@ -165,7 +166,7 @@ def train(args):
 
     obs_dim = episode.observations.shape[1]
     act_dim = episode.actions.shape[1]
-    trans_dim = obs_dim + act_dim + obs_dim + 1 + 1 + 1  # rtg, timesteps, mask
+    trans_dim = obs_dim + act_dim + obs_dim + 1 + 1 + 1 + obs_dim # rtg, timesteps, mask
 
     # used for input normalization
     obs_stats = jnp.concatenate(obs_stats, axis=0)
@@ -178,17 +179,23 @@ def train(args):
         padding_len = (max_epi_len + context_len) - traj_len
         obs = jnp.array(episode.observations[:-1,:])
         next_obs = jnp.array(episode.observations[1:,:])
+        prev_obs = jnp.concatenate([#jnp.zeros((1, obs_dim)),
+                                    jnp.array(episode.observations[:1,:]), # assume first previous step same as first step
+                                    jnp.array(episode.observations[:-2,:])], axis=0)
 
         # apply input normalization
         if not args.rm_normalization:
             obs = (obs - obs_mean) / obs_std
             next_obs = (next_obs - obs_mean) / obs_std
+            prev_obs = (prev_obs - obs_mean) / obs_std
 
         obs = jnp.concatenate([obs,
                                jnp.zeros((padding_len, obs_dim))], axis=0)
         actions = jnp.concatenate([jnp.array(episode.actions),
                                    jnp.zeros((padding_len, act_dim))], axis=0)
         next_obs = jnp.concatenate([next_obs,
+                                    jnp.zeros((padding_len, obs_dim))], axis=0)
+        prev_obs = jnp.concatenate([prev_obs,
                                     jnp.zeros((padding_len, obs_dim))], axis=0)
         returns_to_go = jnp.concatenate([jnp.array(discount_cumsum(episode.rewards, 1.0) / rtg_scale).reshape(-1, 1), 
                                          jnp.zeros((padding_len, 1))], axis=0)
@@ -197,7 +204,7 @@ def train(args):
         traj_mask = jnp.concatenate([jnp.ones(traj_len).reshape(-1, 1),
                                      jnp.zeros((padding_len, 1))], axis=0)
 
-        padding_data = jnp.concatenate([obs, actions, next_obs, returns_to_go, timesteps, traj_mask], axis=-1)
+        padding_data = jnp.concatenate([obs, actions, next_obs, returns_to_go, timesteps, traj_mask, prev_obs], axis=-1)
         assert trans_dim == padding_data.shape[-1], padding_data.shape
         replay_buffer_data.append(padding_data)
 
@@ -243,47 +250,51 @@ def train(args):
 
     eval_precoder = AutonomousGRU(act_dim=act_dim,
                                   context_len=context_len,
-                                  hidden_size=512)
+                                  hidden_size=128)
 
     prior = MLP(out_dim=controlled_variables_dim*2,
                           h_dims=[256,256])
     
+    def get_actions(obs, key, precoder_params):
+
+        # s_t = jnp.concatenate((minari_env.unwrapped.get_env_state()['qpos'], minari_env.unwrapped.get_env_state()['qpos']))[None, :]
+
+        # # sample from posterior      
+        # cumsum_dims = np.cumsum([obs_dim, act_dim, obs_dim, 1, 1, 1])
+        # y_t = replay_buffer.data[0,ep,t,cumsum_dims[1]:cumsum_dims[2]][jnp.array(controlled_variables)][None]
+        # z_dist_params = jax.jit(eval_encoder.apply)(encoder_params, jnp.concatenate([normalize_obs(s_t), y_t], axis=-1))
+        # z_mean, z_log_std = get_mean_and_log_std(z_dist_params)
+        # dist_z_post = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
+        # z_t = dist_z_post.sample(seed=key)
+
+        target_agnostic_obs = obs - np.concatenate((np.zeros(33),
+                                                    obs[33:36],
+                                                    obs[33:36]))
+
+        target_agnostic_obs = normalize_obs(target_agnostic_obs)
+
+        target_agnostic_obs = jnp.concatenate((target_agnostic_obs, target_agnostic_obs), axis=-1)
+        
+        # prior_z_params = jax.jit(prior.apply)(prior_params, target_agnostic_obs[None])
+        # prior_mean, prior_log_std = jnp.split(prior_z_params, 2, axis=-1)
+        # min_log_std = -20.
+        # max_log_std = 2.
+        # prior_log_std = jnp.clip(prior_log_std, min_log_std, max_log_std)
+        # dist_z_prior = tfd.MultivariateNormalDiag(loc=prior_mean, scale_diag=jnp.exp(prior_log_std))
+        # z_t = dist_z_prior.sample(seed=key)
+
+        # sample from prior
+        z_t = dist_z_prior.sample(seed=key)
+        
+        actions = jax.jit(eval_precoder.apply)(precoder_params, target_agnostic_obs[None,None, :], z_t)
+
+        return actions[0,:,:]
+    
     def eval_model(model, params, iter, loop='open'):
 
-        prior_params = {'params': params['params']['prior']}
+        # prior_params = {'params': params['params']['prior']}
         encoder_params = {'params': params['params']['encoder']}
         precoder_params = {'params': params['params']['precoder']}
-
-        def get_actions(obs, key):
-
-            # s_t = jnp.concatenate((minari_env.unwrapped.get_env_state()['qpos'], minari_env.unwrapped.get_env_state()['qpos']))[None, :]
-
-            # # sample from posterior      
-            # cumsum_dims = np.cumsum([obs_dim, act_dim, obs_dim, 1, 1, 1])
-            # y_t = replay_buffer.data[0,ep,t,cumsum_dims[1]:cumsum_dims[2]][jnp.array(controlled_variables)][None]
-            # z_dist_params = jax.jit(eval_encoder.apply)(encoder_params, jnp.concatenate([normalize_obs(s_t), y_t], axis=-1))
-            # z_mean, z_log_std = get_mean_and_log_std(z_dist_params)
-            # dist_z_post = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
-            # z_t = dist_z_post.sample(seed=key)
-
-            target_agnostic_obs = obs - np.concatenate((np.zeros(33),
-                                                        obs[33:36],
-                                                        obs[33:36]))
-            
-            prior_z_params = jax.jit(prior.apply)(prior_params, target_agnostic_obs[None])
-            prior_mean, prior_log_std = jnp.split(prior_z_params, 2, axis=-1)
-            min_log_std = -20.
-            max_log_std = 2.
-            prior_log_std = jnp.clip(prior_log_std, min_log_std, max_log_std)
-            dist_z_prior = tfd.MultivariateNormalDiag(loc=prior_mean, scale_diag=jnp.exp(prior_log_std))
-            z_t = dist_z_prior.sample(seed=key)
-
-            # sample from prior
-            # z_t = dist_z_prior.sample(seed=key)
-            
-            actions = jax.jit(eval_precoder.apply)(precoder_params, normalize_obs(target_agnostic_obs)[None,None, :], z_t)
-
-            return actions[0,:,:]
 
         n_rollouts = 3
         for rollout in range(n_rollouts):
@@ -293,7 +304,7 @@ def train(args):
             # minari_env.unwrapped.set_state(qpos=initial_state[:36], qvel=initial_state[36:72])
             frames = []
             key = jax.random.PRNGKey(seed)
-            actions = get_actions(obs, key)
+            actions = get_actions(obs, key, precoder_params)
             for t in range(50):
                 # key, subkey = jax.random.split(key)
                 # action = get_actions(obs, ep, t, subkey)[0,0,:]
@@ -311,6 +322,97 @@ def train(args):
         plt.close()
 
         return None
+
+    ###################################### evaluate dyanmics ###################################### 
+
+    def eval_dynamics(key, precoder_params, dynamics_apply, dynamics_params, iter):
+
+        # obs, _ = minari_env.reset()
+        # x = minari_env.step(minari_env.action_space.sample())
+        # minari_env.unwrapped.get_env_state()['qpos'][:30]-x[0][:30] = 0
+        # (Pdb) np.isclose(obs[36:]-obj_pos_0, minari_env.unwrapped.get_env_state()['qpos'][30:33]-qpos_ob_0)
+        # array([ True,  True,  True])
+        # (Pdb) np.isclose(obs[36:]-obj_pos_0, minari_env.unwrapped.get_env_state()['qpos'][30:33])
+        # array([ True,  True,  True])
+
+        def get_predicted_obs(obs, key, actions, dynamics_params):
+
+            def peform_rollout(state, key, actions, dynamics_params):
+                
+                def step_fn(carry, action):
+                    state, key, dynamics_params = carry
+                    key, dropout_key, sample_i_key, sample_s_key = jax.random.split(key, 4)
+                    
+                    # multiple samples
+                    dropout_keys = jax.random.split(dropout_key, args.n_dynamics_ensembles)
+                    s_dist_params = jax.vmap(dynamics_apply, in_axes=(0,None,None,0))(dynamics_params, state, action, dropout_keys)
+                    # s_dist_params = dynamics_apply(dynamics_params, state, action, dropout_key)
+                    s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
+                    disagreement = jnp.var(s_mean, axis=0).mean()
+
+                    idx = jax.random.categorical(sample_i_key, jnp.ones(args.n_dynamics_ensembles), axis=-1)
+                    s_dist = tfd.MultivariateNormalDiag(loc=s_mean[idx], scale_diag=jnp.exp(s_log_std[idx]))
+
+                    delta_s = s_dist.sample(seed=sample_s_key)
+                    # next_state = state + delta_s
+                    s_curr = state[...,obs_dim:]
+                    s_next = s_curr + delta_s
+                    s_next_mean = s_curr + s_mean.mean(axis=0)
+
+                    next_state = jnp.concatenate([s_curr, s_next], axis=-1)
+
+                    carry = next_state, key, dynamics_params
+                    return carry, (s_curr, s_next_mean, s_dist_params, disagreement)
+
+                carry = state, key, dynamics_params
+                _, (s_curr, s_next_mean, s_dist_params, disagreement) = jax.lax.scan(step_fn, carry, actions)
+                
+                return s_curr, s_next_mean, s_dist_params, disagreement
+            
+            batch_peform_rollout = jax.vmap(peform_rollout, in_axes=(0,0,0,None))
+
+            target_agnostic_obs = obs - np.concatenate((np.zeros(33),
+                                            obs[33:36],
+                                            obs[33:36]))
+
+            target_agnostic_obs = normalize_obs(target_agnostic_obs)
+
+            target_agnostic_obs = jnp.concatenate((target_agnostic_obs, target_agnostic_obs), axis=-1)
+
+            dynamics_keys = jax.random.split(key, actions.shape[0])
+            _, predicted_obs_traj, _, _ = batch_peform_rollout(target_agnostic_obs[None], dynamics_keys, actions, dynamics_params)
+
+            return predicted_obs_traj
+
+        n_rollouts = 3
+        for rollout in range(n_rollouts):
+            obs, _ = minari_env.reset()
+            _ = learned_minari_env.reset()
+            env_state = {'obj_pos': minari_env.unwrapped.get_env_state()['obj_pos'],
+                         'qpos': minari_env.unwrapped.get_env_state()['qpos'],
+                         'qvel': minari_env.unwrapped.get_env_state()['qvel'],
+                         'target_pos': minari_env.unwrapped.get_env_state()['target_pos']}
+            learned_minari_env.unwrapped.set_env_state(env_state)
+            frames = []
+            key = jax.random.PRNGKey(seed)
+            actions = get_actions(obs, key, precoder_params)
+            predicted_obs_traj = get_predicted_obs(obs, key, actions[None], dynamics_params)
+            predicted_obs_traj = unnormalize_obs(predicted_obs_traj)
+            predicted_obs_traj += np.concatenate((np.zeros(33),
+                                                    obs[33:36],
+                                                    obs[33:36]))[None,None]
+            predicted_obs_traj = np.array(predicted_obs_traj)
+            qpos_obj_pos = predicted_obs_traj[:, :, 36:] - obs[None,None,36:]
+            qpos = np.zeros(36)
+            frames.append(np.concatenate((minari_env.render(), learned_minari_env.render()), axis=1))
+            for t in range(args.context_len):
+                qpos[:30] = predicted_obs_traj[0, t, :30]
+                qpos[30:33] = qpos_obj_pos[0, t, :]
+                learned_minari_env.unwrapped.set_state(qpos=qpos, qvel=qpos*0.)
+                _ = minari_env.step(actions[t,:])
+                frames.append(np.concatenate((minari_env.render(), learned_minari_env.render()), axis=1))
+
+            imageio.mimsave(os.path.join(log_dir, 'learned_dynamics_video_' + str(iter) + '_' + str(rollout) + '.mp4'), frames, fps=30)
 
     ###################################### dynamics training ###################################### 
 
@@ -350,12 +452,13 @@ def train(args):
         # batch_size = 1
         dummy_states = jnp.zeros((batch_size, obs_dim))
         dummy_actions = jnp.zeros((batch_size, act_dim))
+        s_tm1_s_t = jnp.concatenate([dummy_states, dummy_states], axis=-1)
         key_params, key_dropout, key = jax.random.split(global_key, 3)
         dynamics_params_list = []
         # create ensemble of dynamics models
         for i in range(args.n_dynamics_ensembles):
             # dynamics_params_list.append(dynamics_model.init({'params': key_params, 'dropout': key_dropout}))
-            dynamics_params_list.append(dynamics_model.init({'params': key_params}, dummy_states, dummy_actions, key_dropout))
+            dynamics_params_list.append(dynamics_model.init({'params': key_params}, s_tm1_s_t, dummy_actions, key_dropout))
             key_params, key_dropout, key = jax.random.split(key, 3)
 
         dynamics_params = jax.tree_util.tree_map(lambda *p: jnp.stack(p), *dynamics_params_list)
@@ -383,6 +486,7 @@ def train(args):
             ts = transitions.ts.reshape(transitions.ts.shape[:2]).astype(jnp.int32)  # (batch_size_per_device, context_len)
             rtg_t = transitions.rtg_t  # (batch_size_per_device, context_len, 1)
             mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
+            s_tm1 = transitions.s_tm1
 
             # horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
             # y_t = transitions.s_tp1[...,controlled_variables]  # (batch_size_per_device, context_len, controlled_variables_dim)
@@ -430,7 +534,8 @@ def train(args):
 
             # loss /= controlled_variables_dim
 
-            s_p = dynamics_model.apply(dynamics_params, s_t, a_t, key)
+            s_tm1_s_t = jnp.concatenate([s_tm1, s_t], axis=-1)
+            s_p = dynamics_model.apply(dynamics_params, s_tm1_s_t, a_t, key)
             s_mean, s_log_std = jnp.split(s_p, 2, axis=-1)
             min_log_std = -20.
             max_log_std = 2. 
@@ -452,15 +557,15 @@ def train(args):
             transitions: jnp.ndarray,
         ) -> Tuple[TrainingState, bool, Dict[str, jnp.ndarray]]:
 
-            cumsum_dims = np.cumsum([obs_dim, act_dim, obs_dim, 1, 1, 1])
-
+            cumsum_dims = np.cumsum([obs_dim, act_dim, obs_dim, 1, 1, 1, obs_dim])
             transitions = Transition(
                 s_t=transitions[:, :, :cumsum_dims[0]],
                 a_t=transitions[:, :, cumsum_dims[0]:cumsum_dims[1]],
                 s_tp1=transitions[:, :, cumsum_dims[1]:cumsum_dims[2]],
                 rtg_t=transitions[:, :, cumsum_dims[2]:cumsum_dims[3]],
                 ts=transitions[:, :, cumsum_dims[3]:cumsum_dims[4]],
-                mask_t=transitions[:, :, cumsum_dims[4]:cumsum_dims[5]]
+                mask_t=transitions[:, :, cumsum_dims[4]:cumsum_dims[5]],
+                s_tm1=transitions[:, :, cumsum_dims[5]:cumsum_dims[6]]
             )
 
             key, key_dynamics = jax.random.split(state.key, 2)
@@ -603,7 +708,7 @@ def train(args):
 
     else:
 
-        total_updates = 100000
+        total_updates = 300000
         load_model_path = os.path.join(log_dir, "dynamics_model.pt")
         load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
         _dynamics_params = load_params(load_current_model_path)
@@ -697,7 +802,7 @@ def train(args):
 
         batch_size = 1
         dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
-        dummy_states = jnp.zeros((batch_size, context_len, obs_dim))
+        dummy_states = jnp.zeros((batch_size, context_len, obs_dim*2))
         dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
         if args.trajectory_version:
             dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
@@ -755,6 +860,7 @@ def train(args):
         s_tp1 = transitions.s_tp1
         rtg_t = transitions.rtg_t  # (batch_size_per_device, context_len, 1)
         mask = transitions.mask_t  # (batch_size_per_device, context_len, 1)
+        s_tm1 = transitions.s_tm1
         
         horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
         
@@ -768,10 +874,12 @@ def train(args):
 
         vae_key, dropout_key = jax.random.split(key, 2)
 
-        kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss = vae_model.apply(vae_params, ts, s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, vae_key, rngs={'dropout': dropout_key})
+        s_tm1_s_t = jnp.concatenate([s_tm1, s_t], axis=-1)
 
-        return kl_loss + action_decoder_loss + controlled_variable_decoder_loss + disagreement_loss * args.uncertainty_weight, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss)
-        # return kl_loss + action_decoder_loss * (1-w) + controlled_variable_decoder_loss * w + disagreement_loss * args.uncertainty_weight, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss)
+        kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss = vae_model.apply(vae_params, ts, s_tm1_s_t, dummy_z_t, a_t, y_t, rtg_t, horizon, mask, dynamics_model.apply, _dynamics_params, vae_key, rngs={'dropout': dropout_key})
+
+        # return kl_loss + action_decoder_loss + controlled_variable_decoder_loss + disagreement_loss * args.uncertainty_weight, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss)
+        return kl_loss + action_decoder_loss * (1-w) + controlled_variable_decoder_loss * w + disagreement_loss * args.uncertainty_weight, (kl_loss, action_decoder_loss, controlled_variable_decoder_loss, disagreement_loss)
 
     vae_grad = jax.jit(jax.value_and_grad(vae_loss, has_aux=True))
 
@@ -781,7 +889,7 @@ def train(args):
         transitions: jnp.ndarray,
     ) -> Tuple[TrainingState, bool, Dict[str, jnp.ndarray]]:
 
-        cumsum_dims = np.cumsum([obs_dim, act_dim, obs_dim, 1, 1, 1])
+        cumsum_dims = np.cumsum([obs_dim, act_dim, obs_dim, 1, 1, 1, obs_dim])
 
         transitions = Transition(
             s_t=transitions[:, :, :cumsum_dims[0]],
@@ -789,10 +897,14 @@ def train(args):
             s_tp1=transitions[:, :, cumsum_dims[1]:cumsum_dims[2]],
             rtg_t=transitions[:, :, cumsum_dims[2]:cumsum_dims[3]],
             ts=transitions[:, :, cumsum_dims[3]:cumsum_dims[4]],
-            mask_t=transitions[:, :, cumsum_dims[4]:cumsum_dims[5]]
+            mask_t=transitions[:, :, cumsum_dims[4]:cumsum_dims[5]],
+            s_tm1=transitions[:, :, cumsum_dims[5]:cumsum_dims[6]]
         )
 
         key, key_vae = jax.random.split(state.key, 2)
+
+        # w = jnp.where(state.steps/(num_updates_per_iter*1_000) < 0.5, 0., state.steps/(num_updates_per_iter*1_000) - 0.5)
+        # w = jnp.clip(w, 0., 1.)
 
         w = state.steps/(num_updates_per_iter*1_000)
         if args.y_decoder_weight is None:
@@ -946,6 +1058,7 @@ def train(args):
             print("saving current model at: " + save_current_model_path)
             save_params(save_current_model_path, _vae_params)
             eval_model('vae', _vae_params, total_updates) # for model in ['vae', 'emp']:
+            eval_dynamics(vae_training_state.key, {'params': _vae_params['params']['precoder']}, dynamics_model.apply, _dynamics_params, total_updates)
 
     synchronize_hosts()
     
@@ -1243,12 +1356,12 @@ if __name__ == "__main__":
     parser.add_argument('--n_blocks', type=int, default=3)
     parser.add_argument('--embed_dim', type=int, default=128)
     parser.add_argument('--n_heads', type=int, default=1)
-    parser.add_argument('--dropout_p', type=float, default=0.)
+    parser.add_argument('--dropout_p', type=float, default=0.1)
     parser.add_argument('--gradient_clipping', type=float, default=0.25)
     
     parser.add_argument('--n_dynamics_ensembles', type=int, default=4)
     parser.add_argument('--h_dims_dynamics', type=List, default=[256,256])
-    parser.add_argument('--dynamics_dropout_rates', type=List, default=[0., 0.])
+    parser.add_argument('--dynamics_dropout_rates', type=List, default=[0.1, 0.1])
     parser.add_argument('--dynamics_dropout_p', type=float, default=0.)
 
     parser.add_argument('--dynamics_batch_size', type=int, default=2048)
@@ -1259,7 +1372,7 @@ if __name__ == "__main__":
     parser.add_argument('--wt_decay', type=float, default=1e-4)
     parser.add_argument('--warmup_steps', type=int, default=10_000)
 
-    parser.add_argument('--max_train_iters', type=int, default=1000)
+    parser.add_argument('--max_train_iters', type=int, default=3000)
     parser.add_argument('--num_updates_per_iter', type=int, default=100)
     parser.add_argument('--dynamics_save_iters', type=int, default=500)
     parser.add_argument('--vae_save_iters', type=int, default=100)
@@ -1274,7 +1387,7 @@ if __name__ == "__main__":
     
     parser.add_argument('--resume_dynamics', action='store_true')
     parser.add_argument('--resume_vae', action='store_true')
-    parser.add_argument('--resume_start_time_str', type=str, default='25-07-06-18-27-39') # None, '25-06-25-16-17-25'
+    parser.add_argument('--resume_start_time_str', type=str, default='25-07-07-16-32-20') # None, '25-06-25-16-17-25'
 
     args = parser.parse_args()
 
