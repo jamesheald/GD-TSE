@@ -20,6 +20,27 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from typing import Any, Callable, Tuple
+import math
+
+class mish(nn.Module):
+
+    @nn.compact
+    def __call__(self, x):
+
+        return x * nn.tanh(nn.softplus(x))
+
+class sinusoidal_pos_emb(nn.Module):
+    dim: int
+
+    def __call__(self, x):
+        
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = jnp.exp(jnp.arange(half_dim) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = jnp.concatenate((jnp.sin(emb), jnp.cos(emb)), axis = -1)
+
+        return emb
 
 class AutonomousGRU(nn.Module):
     hidden_size: int
@@ -508,7 +529,7 @@ def make_transformer_networks(state_dim: int,
                               transformer_type: str) -> FeedForwardModel:
     batch_size = 1
     dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
-    dummy_states = jnp.zeros((batch_size, context_len, state_dim))
+    dummy_states = jnp.zeros((batch_size, context_len, state_dim*2))
     dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
     if trajectory_version:
         dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
@@ -685,86 +706,86 @@ class VAE(linen.Module):
 
         ###################### Markov dynamics ###################### 
 
-        # predict future states
-        # sample a state sequence autoregressively from the learned markov dynamics model
-        def peform_rollout(state, key, actions, dynamics_params):
+        # # predict future states
+        # # sample a state sequence autoregressively from the learned markov dynamics model
+        # def peform_rollout(state, key, actions, dynamics_params):
             
-            def step_fn(carry, action):
-                state, key, dynamics_params = carry
-                key, dropout_key, sample_i_key, sample_s_key = jax.random.split(key, 4)
+        #     def step_fn(carry, action):
+        #         state, key, dynamics_params = carry
+        #         key, dropout_key, sample_i_key, sample_s_key = jax.random.split(key, 4)
                 
-                # multiple samples
-                dropout_keys = jax.random.split(dropout_key, self.n_dynamics_ensembles)
-                s_dist_params = jax.vmap(dynamics_apply, in_axes=(0,None,None,0))(dynamics_params, state, action, dropout_keys)
-                # s_dist_params = dynamics_apply(dynamics_params, state, action, dropout_key)
-                s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
-                disagreement = jnp.var(s_mean, axis=0).mean()
+        #         # multiple samples
+        #         dropout_keys = jax.random.split(dropout_key, self.n_dynamics_ensembles)
+        #         s_dist_params = jax.vmap(dynamics_apply, in_axes=(0,None,None,0))(dynamics_params, state, action, dropout_keys)
+        #         # s_dist_params = dynamics_apply(dynamics_params, state, action, dropout_key)
+        #         s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
+        #         disagreement = jnp.var(s_mean, axis=0).mean()
 
-                idx = jax.random.categorical(sample_i_key, jnp.ones(self.n_dynamics_ensembles), axis=-1)
-                s_dist = tfd.MultivariateNormalDiag(loc=s_mean[idx], scale_diag=jnp.exp(s_log_std[idx]))
+        #         idx = jax.random.categorical(sample_i_key, jnp.ones(self.n_dynamics_ensembles), axis=-1)
+        #         s_dist = tfd.MultivariateNormalDiag(loc=s_mean[idx], scale_diag=jnp.exp(s_log_std[idx]))
 
-                delta_s = s_dist.sample(seed=sample_s_key)
-                # next_state = state + delta_s
-                s_curr = state[...,self.state_dim:]
-                s_next = s_curr + delta_s
+        #         delta_s = s_dist.sample(seed=sample_s_key)
+        #         # next_state = state + delta_s
+        #         s_curr = state[...,self.state_dim:]
+        #         s_next = s_curr + delta_s
 
-                next_state = jnp.concatenate([s_curr, s_next], axis=-1)
+        #         next_state = jnp.concatenate([s_curr, s_next], axis=-1)
 
-                carry = next_state, key, dynamics_params
-                return carry, (s_curr, s_dist_params, disagreement)
+        #         carry = next_state, key, dynamics_params
+        #         return carry, (s_curr, s_dist_params, disagreement)
 
-            carry = state, key, dynamics_params
-            _, (s_curr, s_dist_params, disagreement) = jax.lax.scan(step_fn, carry, actions)
+        #     carry = state, key, dynamics_params
+        #     _, (s_curr, s_dist_params, disagreement) = jax.lax.scan(step_fn, carry, actions)
             
-            return s_curr, s_dist_params, disagreement
+        #     return s_curr, s_dist_params, disagreement
         
-        batch_peform_rollout = jax.vmap(peform_rollout, in_axes=(0,0,0,None))
+        # batch_peform_rollout = jax.vmap(peform_rollout, in_axes=(0,0,0,None))
 
-        dynamics_keys = jax.random.split(key, actions.shape[0])
-        s_samp, s_dist_params, disagreement = batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions, dynamics_params)
+        # dynamics_keys = jax.random.split(key, actions.shape[0])
+        # s_samp, s_dist_params, disagreement = batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions, dynamics_params)
 
-        s_mean, s_log_std = jnp.split(s_dist_params, 2, axis=-1)
-        min_log_std = -20.
-        max_log_std = 2.
-        s_log_std = jnp.clip(s_log_std, min_log_std, max_log_std)
+        # s_mean, s_log_std = jnp.split(s_dist_params, 2, axis=-1)
+        # min_log_std = -20.
+        # max_log_std = 2.
+        # s_log_std = jnp.clip(s_log_std, min_log_std, max_log_std)
 
-        s_samp = jnp.take_along_axis(s_samp, horizon[..., None]-1, axis=1)[:,:,None,self.controlled_variables]
-        s_mean = jnp.take_along_axis(s_mean, horizon[..., None, None]-1, axis=1)[...,self.controlled_variables]
-        s_log_std = jnp.take_along_axis(s_log_std, horizon[..., None, None]-1, axis=1)[...,self.controlled_variables]
+        # s_samp = jnp.take_along_axis(s_samp, horizon[..., None]-1, axis=1)[:,:,None,self.controlled_variables]
+        # s_mean = jnp.take_along_axis(s_mean, horizon[..., None, None]-1, axis=1)[...,self.controlled_variables]
+        # s_log_std = jnp.take_along_axis(s_log_std, horizon[..., None, None]-1, axis=1)[...,self.controlled_variables]
 
-        y_dist = tfd.MultivariateNormalDiag(loc=s_samp + s_mean, scale_diag=jnp.exp(s_log_std))
-        y_log_probs = y_dist.log_prob(y_h[:,:,None,:].repeat(self.n_dynamics_ensembles,axis=2))
+        # y_dist = tfd.MultivariateNormalDiag(loc=s_samp + s_mean, scale_diag=jnp.exp(s_log_std))
+        # y_log_probs = y_dist.log_prob(y_h[:,:,None,:].repeat(self.n_dynamics_ensembles,axis=2))
 
-        # y_mse = 0.5 * ((s_samp + s_mean - y_h[:,:,None,:].repeat(self.n_dynamics_ensembles,axis=2))**2).sum(axis=-1)
+        # # y_mse = 0.5 * ((s_samp + s_mean - y_h[:,:,None,:].repeat(self.n_dynamics_ensembles,axis=2))**2).sum(axis=-1)
 
         ###################### dynamics ###################### 
 
-        # deterministic=True
-        # y_p = jax.vmap(dynamics_apply, in_axes=(0,None,None,None,None,None,None,None,None))(dynamics_params,
-        #                                                         ts,
-        #                                                         s_t,
-        #                                                         z_t,
-        #                                                         actions,
-        #                                                         y_t,
-        #                                                         rtg_t,
-        #                                                         horizon,
-        #                                                         deterministic)
+        deterministic=False
+        y_p = jax.vmap(dynamics_apply, in_axes=(0,None,None,None,None,None,None,None,None))(dynamics_params,
+                                                                ts,
+                                                                s_t,
+                                                                z_t,
+                                                                actions,
+                                                                y_t,
+                                                                rtg_t,
+                                                                horizon,
+                                                                deterministic)
 
-        # def true_fn(y_mean, y_log_std, y_t):
-        #     dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
-        #     return dist.log_prob(y_t)
+        def true_fn(y_mean, y_log_std, y_t):
+            dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
+            return dist.log_prob(y_t)
 
-        # y_mean, y_log_std = jnp.split(y_p, 2, axis=-1)
-        # min_log_std = -20.
-        # max_log_std = 2.
-        # y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
-        # delta_y_t = y_h - s_t[:,:1,self.controlled_variables]
-        # delta_y_t = delta_y_t[None].repeat(self.n_dynamics_ensembles,axis=0)
+        y_mean, y_log_std = jnp.split(y_p, 2, axis=-1)
+        min_log_std = -20.
+        max_log_std = 2.
+        y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
+        delta_y_t = y_h - s_t[:,:1,self.controlled_variables]
+        delta_y_t = delta_y_t[None].repeat(self.n_dynamics_ensembles,axis=0)
 
-        # y_mean = jnp.take_along_axis(y_mean, horizon[None, ..., None]-1, axis=2)
-        # y_log_std = jnp.take_along_axis(y_log_std, horizon[None, ..., None]-1, axis=2)
+        y_mean = jnp.take_along_axis(y_mean, horizon[None, ..., None]-1, axis=2)
+        y_log_std = jnp.take_along_axis(y_log_std, horizon[None, ..., None]-1, axis=2)
 
-        # y_log_probs = true_fn(y_mean, y_log_std, delta_y_t)
+        y_log_probs = true_fn(y_mean, y_log_std, delta_y_t)
 
         ###################### loss ###################### 
 
@@ -802,7 +823,8 @@ class VAE(linen.Module):
         kl_loss /= self.act_dim
         a_decoder_loss /= self.act_dim
         y_decoder_loss /= self.act_dim
-        disagreement_loss = disagreement.mean() / self.act_dim
+        # disagreement_loss = disagreement.mean() / self.act_dim
+        disagreement_loss = 0.
 
         return kl_loss, a_decoder_loss, y_decoder_loss, disagreement_loss
     
@@ -855,13 +877,20 @@ class empowerment(linen.Module):
     context_len: int
     n_heads: int
     drop_p: float
+    gamma: float
     n_dynamics_ensembles: int
     alternate_training: bool = False
     sample_one_model: bool = True
     use_flow: bool = False
-    state_dependent_source: bool = True
+    state_dependent_source: bool = False
+    horizon_embed_dim: int = 128
 
     def setup(self):
+
+        self.horizon_mlp = nn.Sequential([sinusoidal_pos_emb(self.horizon_embed_dim),
+                                          nn.Dense(self.horizon_embed_dim * 4),
+                                          mish(),
+                                          nn.Dense(self.horizon_embed_dim)])
 
         if self.state_dependent_source:
             self.prior = MLP(out_dim=self.controlled_variables_dim*2,
@@ -923,10 +952,10 @@ class empowerment(linen.Module):
 
         else:
 
-            dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_t.shape), scale_diag=jnp.ones(z_t.shape))
+            source_dist = tfd.MultivariateNormalDiag(loc=jnp.zeros(z_t.shape), scale_diag=jnp.ones(z_t.shape))
             # sample_z_keys = jax.random.split(sample_z_key, s_t.shape[0])
             # z_samp = jax.vmap(dist_z_prior.sample)(seed=sample_z_keys)
-            z_samp = dist_z_prior.sample(seed=sample_z_key)
+            z_samp = source_dist.sample(seed=sample_z_key)
 
         ###################### precode ###################### 
 
@@ -949,79 +978,77 @@ class empowerment(linen.Module):
 
         ###################### Markov dynamics ###################### 
 
-        # predict future states
-        # sample a state sequence autoregressively from the learned markov dynamics model
-        def peform_rollout(state, key, actions, dynamics_params):
+        # # predict future states
+        # # sample a state sequence autoregressively from the learned markov dynamics model
+        # def peform_rollout(state, key, actions, dynamics_params):
             
-            def step_fn(carry, action):
-                state, key, dynamics_params = carry
-                key, dropout_key, sample_i_key, sample_s_key = jax.random.split(key, 4)
+        #     def step_fn(carry, action):
+        #         state, key, dynamics_params = carry
+        #         key, dropout_key, sample_i_key, sample_s_key = jax.random.split(key, 4)
                 
-                # multiple samples
-                dropout_keys = jax.random.split(dropout_key, self.n_dynamics_ensembles)
-                s_dist_params = jax.vmap(dynamics_apply, in_axes=(0,None,None,0))(dynamics_params, state, action, dropout_keys)
-                # s_dist_params = dynamics_apply(dynamics_params, state, action, dropout_key)
-                s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
-                disagreement = jnp.var(s_mean, axis=0).mean()
+        #         # multiple samples
+        #         dropout_keys = jax.random.split(dropout_key, self.n_dynamics_ensembles)
+        #         s_dist_params = jax.vmap(dynamics_apply, in_axes=(0,None,None,0))(dynamics_params, state, action, dropout_keys)
+        #         # s_dist_params = dynamics_apply(dynamics_params, state, action, dropout_key)
+        #         s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
+        #         disagreement = jnp.var(s_mean, axis=0).mean()
 
-                idx = jax.random.categorical(sample_i_key, jnp.ones(self.n_dynamics_ensembles), axis=-1)
-                s_dist = tfd.MultivariateNormalDiag(loc=s_mean[idx], scale_diag=jnp.exp(s_log_std[idx]))
+        #         idx = jax.random.categorical(sample_i_key, jnp.ones(self.n_dynamics_ensembles), axis=-1)
+        #         s_dist = tfd.MultivariateNormalDiag(loc=s_mean[idx], scale_diag=jnp.exp(s_log_std[idx]))
 
-                delta_s = s_dist.sample(seed=sample_s_key)
-                next_state = state + delta_s
-                carry = next_state, key, dynamics_params
-                return carry, (next_state, disagreement)
+        #         delta_s = s_dist.sample(seed=sample_s_key)
+        #         next_state = state + delta_s
+        #         carry = next_state, key, dynamics_params
+        #         return carry, (next_state, disagreement)
 
-            carry = state, key, dynamics_params
-            _, (next_state, disagreement) = jax.lax.scan(step_fn, carry, actions)
+        #     carry = state, key, dynamics_params
+        #     _, (next_state, disagreement) = jax.lax.scan(step_fn, carry, actions)
             
-            return next_state, disagreement
+        #     return next_state, disagreement
         
-        batch_peform_rollout = jax.vmap(peform_rollout, in_axes=(0,0,0,None))
+        # batch_peform_rollout = jax.vmap(peform_rollout, in_axes=(0,0,0,None))
 
-        dynamics_keys = jax.random.split(key, actions.shape[0])
-        next_state, _ = batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions, dynamics_params)
+        # dynamics_keys = jax.random.split(key, actions.shape[0])
+        # next_state, _ = batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions, dynamics_params)
 
-        y_samp = jnp.take_along_axis(next_state, horizon[..., None]-1, axis=1)[...,self.controlled_variables]
+        # y_samp = jnp.take_along_axis(next_state, horizon[..., None]-1, axis=1)[...,self.controlled_variables]
 
         ###################### sample controlled variable ###################### 
 
-        # deterministic=True
-        # y_p = jax.vmap(dynamics_apply, in_axes=(0,None,None,None,None,None,None,None,None))(dynamics_params,
-        #                                                         ts,
-        #                                                         s_t,
-        #                                                         z_t,
-        #                                                         actions,
-        #                                                         y_t,
-        #                                                         rtg_t,
-        #                                                         horizon,
-        #                                                         deterministic)
+        deterministic=False
+        y_p = jax.vmap(dynamics_apply, in_axes=(0,None,None,None,None,None,None,None,None))(dynamics_params,
+                                                                ts,
+                                                                s_t,
+                                                                z_t,
+                                                                actions,
+                                                                y_t,
+                                                                rtg_t,
+                                                                horizon,
+                                                                deterministic)
 
-        # y_mean, y_log_std = jnp.split(y_p, 2, axis=-1)
-        # idx = jax.random.categorical(sample_i_key, jnp.ones(self.n_dynamics_ensembles), axis=-1)
-        # min_log_std = -20.
-        # max_log_std = 2.
-        # y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
+        y_mean, y_log_std = jnp.split(y_p, 2, axis=-1)
+        idx = jax.random.categorical(sample_i_key, jnp.ones(self.n_dynamics_ensembles), axis=-1)
+        min_log_std = -20.
+        max_log_std = 2.
+        y_log_std = jnp.clip(y_log_std, min_log_std, max_log_std)
 
         # y_mean = jnp.take_along_axis(y_mean, horizon[None, ..., None]-1, axis=2)
         # y_log_std = jnp.take_along_axis(y_log_std, horizon[None, ..., None]-1, axis=2)
         
-        # if self.sample_one_model:
+        if self.sample_one_model:
 
-        #     # sample a dynamics model from ensemble
-        #     delta_y_dist = tfd.MultivariateNormalDiag(loc=y_mean[idx],
-        #                                             scale_diag=jnp.exp(y_log_std[idx]))
-        #     delta_y = delta_y_dist.sample(seed=sample_y_key)
-        #     y_samp = s_t[:,:1,self.controlled_variables] + delta_y
+            # sample a dynamics model from ensemble
+            delta_y_dist = tfd.MultivariateNormalDiag(loc=y_mean[idx],
+                                                    scale_diag=jnp.exp(y_log_std[idx]))
+            delta_y = delta_y_dist.sample(seed=sample_y_key)
+            y_samp = s_t[:,:1,self.controlled_variables] + delta_y
         
-        # else:
+        else:
 
-        #     # use all dynamics models in ensemble
-        #     delta_y_dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
-        #     delta_y = delta_y_dist.sample(seed=sample_y_key)
-        #     y_samp = s_t[:,:1,self.controlled_variables][None] + delta_y
-        #     z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:][None].repeat(self.n_dynamics_ensembles, axis=0), y_samp[:,:,0,:]], axis=-1))
-
+            # use all dynamics models in ensemble
+            delta_y_dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
+            delta_y = delta_y_dist.sample(seed=sample_y_key)
+            y_samp = s_t[:,:1,self.controlled_variables][None] + delta_y
 
         if self.alternate_training:
 
@@ -1038,7 +1065,13 @@ class empowerment(linen.Module):
 
         else:
 
-            z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_samp[:,0,:]], axis=-1))
+            horizon_embedding = self.horizon_mlp(jnp.arange(1,self.context_len+1))[None].repeat(s_t.shape[0],axis=0)
+
+            s_t_expand = s_t[:,:1,:].repeat(self.context_len, axis=1)
+
+            # z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_samp[:,0,:]], axis=-1))
+
+            z_dist_params = self.encoder(jnp.concatenate([s_t_expand, y_samp, horizon_embedding], axis=-1))
 
         ###################### encode NF ###################### 
 
@@ -1046,7 +1079,10 @@ class empowerment(linen.Module):
 
             z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
             min_log_std = -20.
-            max_log_std = 2.
+            if self.state_dependent_source:
+                max_log_std = source_log_std
+            else:
+                max_log_std = 0.
             z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
             base_post_dist = distrax.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
             bijector = self.flow()
@@ -1058,15 +1094,29 @@ class empowerment(linen.Module):
             # and the posterior variance should be less than the prior
             z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)
             min_log_std = -20.
-            max_log_std = 2.
+            if self.state_dependent_source:
+                max_log_std = source_log_std
+            else:
+                max_log_std = 0.
             z_log_std = jnp.clip(z_log_std, min_log_std, max_log_std)
             post_dist = tfd.MultivariateNormalDiag(loc=z_mean, scale_diag=jnp.exp(z_log_std))
 
         ###################### loss ###################### 
 
-        log_prob_z = post_dist.log_prob(z_samp)
+        # log_prob_z = post_dist.log_prob(z_samp)
+        # loss = -jnp.mean(log_prob_z + source_dist.entropy())
+        # loss /= z_samp.shape[-1]
 
-        loss = -jnp.mean(log_prob_z + source_dist.entropy())
+        z_samp_expand = z_samp[:,None,:].repeat(self.context_len, axis=1)
+
+        log_prob_z = post_dist.log_prob(z_samp_expand)
+
+        gamma_geom = self.gamma ** jnp.arange(self.context_len)
+
+        gamma_log_prob_z = gamma_geom[None] * log_prob_z
+        
+        # mean across batch, sum across time
+        loss = jnp.sum(-gamma_log_prob_z[:,:,None] * mask) / log_prob_z.shape[0] - jnp.mean(source_dist.entropy()[:,None] * horizon)
 
         loss /= z_samp.shape[-1]
         
