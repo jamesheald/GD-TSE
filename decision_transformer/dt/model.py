@@ -681,7 +681,7 @@ class VAE(linen.Module):
 
         ###################### keys ###################### 
 
-        key, subkey = jax.random.split(key)
+        key, subkey, dropout_key = jax.random.split(key, 3)
         
         ###################### encode ###################### 
 
@@ -761,6 +761,7 @@ class VAE(linen.Module):
         ###################### dynamics ###################### 
 
         deterministic=False
+        dropout_keys = jax.random.split(dropout_key, self.n_dynamics_ensembles)
         y_p = jax.vmap(dynamics_apply, in_axes=(0,None,None,None,None,None,None,None,None))(dynamics_params,
                                                                 ts,
                                                                 s_t,
@@ -769,7 +770,8 @@ class VAE(linen.Module):
                                                                 y_t,
                                                                 rtg_t,
                                                                 horizon,
-                                                                deterministic)
+                                                                deterministic,
+                                                                rngs={'dropout': dropout_keys})
 
         def true_fn(y_mean, y_log_std, y_t):
             dist = tfd.MultivariateNormalDiag(loc=y_mean, scale_diag=jnp.exp(y_log_std))
@@ -880,7 +882,7 @@ class empowerment(linen.Module):
     gamma: float
     n_dynamics_ensembles: int
     alternate_training: bool = False
-    sample_one_model: bool = True
+    sample_one_model: bool = False
     use_flow: bool = False
     state_dependent_source: bool = False
     horizon_embed_dim: int = 128
@@ -921,7 +923,7 @@ class empowerment(linen.Module):
 
     def __call__(self, ts, s_t, z_t, a_t, y_t, rtg_t, horizon, mask, train_precoder, dynamics_apply, dynamics_params, key):
 
-        sample_z_key, sample_i_key, sample_y_key = jax.random.split(key, 3)
+        sample_z_key, sample_i_key, sample_y_key, dropout_key = jax.random.split(key, 4)
 
         def get_mean_and_log_std(x, min_log_std = -20., max_log_std = 2.):
             x_mean, x_log_std = jnp.split(x, 2, axis=-1)
@@ -1016,6 +1018,7 @@ class empowerment(linen.Module):
         ###################### sample controlled variable ###################### 
 
         deterministic=False
+        dropout_keys = jax.random.split(dropout_key, self.n_dynamics_ensembles)
         y_p = jax.vmap(dynamics_apply, in_axes=(0,None,None,None,None,None,None,None,None))(dynamics_params,
                                                                 ts,
                                                                 s_t,
@@ -1024,7 +1027,8 @@ class empowerment(linen.Module):
                                                                 y_t,
                                                                 rtg_t,
                                                                 horizon,
-                                                                deterministic)
+                                                                deterministic,
+                                                                rngs={'dropout': dropout_keys})
 
         y_mean, y_log_std = jnp.split(y_p, 2, axis=-1)
         idx = jax.random.categorical(sample_i_key, jnp.ones(self.n_dynamics_ensembles), axis=-1)
@@ -1065,11 +1069,13 @@ class empowerment(linen.Module):
 
         else:
 
+            # z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_samp[:,0,:]], axis=-1))
+
             horizon_embedding = self.horizon_mlp(jnp.arange(1,self.context_len+1))[None].repeat(s_t.shape[0],axis=0)
+            horizon_embedding = horizon_embedding[None].repeat(self.n_dynamics_ensembles, axis=0)
 
             s_t_expand = s_t[:,:1,:].repeat(self.context_len, axis=1)
-
-            # z_dist_params = self.encoder(jnp.concatenate([s_t[:,0,:], y_samp[:,0,:]], axis=-1))
+            s_t_expand = s_t_expand[None].repeat(self.n_dynamics_ensembles, axis=0)
 
             z_dist_params = self.encoder(jnp.concatenate([s_t_expand, y_samp, horizon_embedding], axis=-1))
 
@@ -1118,6 +1124,7 @@ class empowerment(linen.Module):
         # mean across batch, sum across time
         loss = jnp.sum(-gamma_log_prob_z[:,:,None] * mask) / log_prob_z.shape[0] - jnp.mean(source_dist.entropy()[:,None] * horizon)
 
+        loss /= self.context_len
         loss /= z_samp.shape[-1]
         
         return loss
