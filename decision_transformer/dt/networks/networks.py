@@ -1,0 +1,493 @@
+"""
+From https://github.com/nikhilbarhate99/min-decision-transformer/blob/master/decision_transformer/model.py
+Causal transformer (GPT) implementation
+"""
+
+# transformers for MDPS
+# https://openreview.net/pdf?id=NHMuM84tRT - LONG SHORT
+# https://openreview.net/pdf?id=af2c8EaKl8 - CONV
+
+
+import dataclasses
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+import math
+
+from flax.linen.initializers import lecun_normal, zeros
+from typing import Any, Callable, List
+
+import tensorflow_probability.substrates.jax as tfp
+tfd = tfp.distributions
+tfb = tfp.bijectors
+
+class mish(nn.Module):
+
+    @nn.compact
+    def __call__(self, x):
+
+        return x * nn.tanh(nn.softplus(x))
+
+class sinusoidal_pos_emb(nn.Module):
+    dim: int
+
+    def __call__(self, x):
+        
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = jnp.exp(jnp.arange(half_dim) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = jnp.concatenate((jnp.sin(emb), jnp.cos(emb)), axis = -1)
+
+        return emb
+
+class AutonomousGRU(nn.Module):
+    hidden_size: int
+    act_dim: int
+    context_len: int
+
+    @nn.compact
+    def __call__(self, s_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
+        # s_t: (batch, 1, state_dim) assumed
+        # z_t: (batch, z_dim)
+    
+        def scan_gru(s_t, z_t):
+            
+            # Initial input: (batch, state_dim + z_dim)
+            initial_input = jnp.concatenate([s_t[0, :], z_t], axis=-1)
+
+            # Map to initial hidden state
+            # initial_carry = nn.Dense(self.hidden_size)(initial_input)
+
+            initial_carry = MLP(out_dim=self.hidden_size,
+                                h_dims=[256,256],
+                                drop_out_rates=[0., 0.])(initial_input)
+
+            gru_cell = nn.GRUCell(features=self.hidden_size)
+
+            # Wrap the GRUCell with nn.RNN
+            # cell_size is typically the hidden state size of the cell
+            rnn_layer = nn.RNN(gru_cell)
+
+            # Apply the RNN layer to the inputs
+            # inputs = jnp.zeros((self.context_len,1))
+            inputs = initial_input[None].repeat(self.context_len, axis=0)
+            _, outputs = rnn_layer(inputs, initial_carry=initial_carry, return_carry=True)
+
+            ys = nn.Dense(self.act_dim)(outputs)
+            # ys = nn.Dense(self.act_dim)(jnp.concatenate((initial_input[None,:].repeat(outputs.shape[0], axis=0), outputs), axis=-1))
+            actions = jnp.tanh(ys)
+                
+            return actions  # (T, act_dim)
+
+        # Vectorize across batch
+        actions = jax.vmap(scan_gru)(s_t, z_t)  # (batch, T, act_dim)
+
+        return actions
+
+class MLP(nn.Module):
+    out_dim: int
+    h_dims: List
+    drop_out_rates: List
+    deterministic: bool = False
+    
+    def setup(self):
+
+        self.mlp = [nn.Sequential([nn.Dense(features=h_dim), nn.LayerNorm(), nn.relu]) for h_dim in self.h_dims]
+        self.mlp_out = nn.Dense(features=self.out_dim)
+
+        self.dropout = [nn.Dropout(rate=layer_i_rate) for layer_i_rate in self.drop_out_rates]
+
+    def __call__(self, x, key=None):
+
+        for i, fn in enumerate(self.mlp):
+            x = fn(x)
+            if self.drop_out_rates[i] > 0.:
+                key, subkey = jax.random.split(key)
+                x = self.dropout[i](x, self.deterministic, subkey)
+        x = self.mlp_out(x)
+
+        return x
+
+class MLP_precoder(nn.Module):
+    act_dim: int
+    context_len: int
+    h_dims: List
+    apply_conv: bool = False
+    
+    def setup(self):
+
+        self.precoder = [nn.Sequential([nn.Dense(features=h_dim), nn.LayerNorm(), nn.relu]) for h_dim in self.h_dims]
+        self.precoder_out = nn.Dense(features=self.context_len*self.act_dim)
+
+    def __call__(self, s_t, z_t):
+
+        x = jnp.concatenate((s_t[:,0,:], z_t), axis=-1)
+        for fn in self.precoder:
+            x = fn(x)
+        # if self.apply_conv:
+            # x = nn.Conv(features=self.h_dims[-1], kernel_size=7, padding="SAME")(h) # kernel_size=3,5,7
+        x = self.precoder_out(x).reshape(-1,self.context_len,self.act_dim)
+        if self.apply_conv:
+            x = nn.Conv(features=self.act_dim, kernel_size=7, padding="SAME", feature_group_count=self.act_dim)(x) # kernel_size=3,5,7
+        actions = jnp.tanh(x)
+
+        return actions
+
+class dynamics(nn.Module):
+    h_dims_dynamics: List
+    state_dim: int
+    drop_out_rates: List
+    learn_std: bool = True
+    deterministic: bool = False
+    
+    def setup(self):
+
+        self.dynamics = [nn.Sequential([nn.Dense(features=h_dim), nn.LayerNorm(), nn.relu]) for h_dim in self.h_dims_dynamics]
+        if self.learn_std:
+            self.dynamics_out = nn.Dense(features=self.state_dim*2)
+        else:
+            self.dynamics_out = nn.Dense(features=self.state_dim)
+        
+        # if len(jnp.array(self.drop_out_rates > 0.)) > 0:
+        self.dropout = [nn.Dropout(rate=layer_i_rate) for layer_i_rate in self.drop_out_rates]
+
+    def __call__(self, obs, actions, key):
+
+        x = jnp.concatenate((obs, actions), axis=-1)
+        for i, fn in enumerate(self.dynamics):
+            x = fn(x)
+            if self.drop_out_rates[i] > 0.:
+                key, subkey = jax.random.split(key)
+                x = self.dropout[i](x, self.deterministic, subkey)
+        x = self.dynamics_out(x)
+
+        return x
+
+@dataclasses.dataclass
+class FeedForwardModel:
+    init: Any
+    apply: Any
+
+class MaskedCausalAttention(nn.Module):
+    h_dim: int
+    max_T: int
+    n_heads: int
+    drop_p: float = 0.1
+    dtype: Any = jnp.float32
+    kernel_init: Callable[..., Any] = lecun_normal()
+    bias_init: Callable[..., Any] = zeros
+    use_causal_mask: bool = True
+
+    def setup(self):
+        self.mask = jnp.tril(jnp.ones((self.max_T, self.max_T))).reshape(1, 1, self.max_T, self.max_T)
+
+    @nn.compact
+    def __call__(self, src: jnp.ndarray, mask: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
+        B, T, C = src.shape # batch size, seq length, h_dim * n_heads
+        N, D = self.n_heads, C // self.n_heads # N = num heads, D = attention dim
+        
+        # rearrange q, k, v as (B, N, T, D)
+        q = nn.Dense(
+            self.h_dim,
+            dtype=self.dtype,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init)(src).reshape(B, T, N, D).transpose(0, 2, 1, 3)
+        k = nn.Dense(
+            self.h_dim,
+            dtype=self.dtype,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init)(src).reshape(B, T, N, D).transpose(0, 2, 1, 3)
+        v = nn.Dense(
+            self.h_dim,
+            dtype=self.dtype,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init)(src).reshape(B, T, N, D).transpose(0, 2, 1, 3)
+        
+        # weights (B, N, T, T)
+        weights = q @ k.transpose(0, 1, 3, 2) / jnp.sqrt(D)
+
+        if self.use_causal_mask:
+            # causal mask applied to weights
+            # mask == True --> weights, mask == False --> -jnp.inf
+            weights = jnp.where(self.mask[..., :T, :T], weights, -jnp.inf)
+        else:
+            weights = jnp.where(jax.vmap(lambda x: jnp.outer(x, x).reshape(1, self.max_T, self.max_T))(mask)[..., :T, :T], weights, -1e30)
+        # normalize weights, all -1e30 -> 0 after softmax
+        normalized_weights = jax.nn.softmax(weights, axis=-1)
+
+        attention = nn.Dropout(
+            rate=self.drop_p,
+            deterministic=deterministic)(normalized_weights @ v)
+        
+        attention = attention.transpose(0, 2, 1, 3).reshape(B, T, N*D)
+
+        projection = nn.Dense(
+            self.h_dim,
+            dtype=self.dtype,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init)(attention)
+
+        out = nn.Dropout(
+            rate=self.drop_p,
+            deterministic=deterministic)(projection)
+
+        return out
+
+class Block(nn.Module):
+    h_dim: int
+    max_T: int
+    n_heads: int
+    drop_p: float = 0.1
+    dtype: Any = jnp.float32
+    kernel_init: Callable[..., Any] = lecun_normal()
+    bias_init: Callable[..., Any] = zeros
+    use_causal_mask: bool = True
+
+    @nn.compact
+    def __call__(self, src: jnp.ndarray, mask: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
+        # Attention -> LayerNorm -> MLP -> LayerNorm
+        src = src + MaskedCausalAttention(
+            h_dim=self.h_dim,
+            max_T=self.max_T,
+            n_heads=self.n_heads,
+            drop_p=self.drop_p,
+            use_causal_mask=self.use_causal_mask
+        )(src, mask, deterministic) # residual
+        src = nn.LayerNorm(dtype=self.dtype)(src)
+
+        src2 = nn.Dense(
+            self.h_dim*4,
+            dtype=self.dtype,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init)(src)
+        src2 = jax.nn.gelu(src2)
+        src2 = nn.Dense(
+            self.h_dim,
+            dtype=self.dtype,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init)(src2)
+        src2 = nn.Dropout(
+            rate=self.drop_p,
+            deterministic=deterministic)(src2)
+
+        src = src + src2 # residual
+        src = nn.LayerNorm(dtype=self.dtype)(src)
+        return src
+    
+class Transformer(nn.Module):
+    state_dim: int
+    act_dim: int
+    controlled_variables_dim: int
+    n_blocks: int
+    h_dim: int
+    context_len: int
+    n_heads: int
+    drop_p: float
+    dtype: Any = jnp.float32
+    max_timestep: int = 4096
+    use_action_tanh: bool = True
+    kernel_init: Callable[..., Any] = lecun_normal()
+    bias_init: Callable[..., Any] = zeros
+    transformer_type: str = 'dynamics' # 'encoder', 'precoder' or 'dynamics'
+    trajectory_version: bool = False
+    apply_conv: bool = False
+
+    def setup(self):
+        None
+    
+    @nn.compact
+    def __call__(self,
+                 timesteps: jnp.ndarray,
+                 states: jnp.ndarray,
+                 latent: jnp.ndarray,
+                 actions: jnp.ndarray,
+                 next_controlled_variables: jnp.ndarray,
+                 returns_to_go: jnp.ndarray,
+                 horizon: jnp.ndarray,
+                 deterministic: bool) -> jnp.ndarray:
+        B, T, _ = states.shape
+
+        horizon_embeddings = nn.Embed(
+            num_embeddings=self.context_len,
+            features=self.h_dim)(horizon-1)
+        
+        if self.transformer_type == 'encoder':
+            max_T = next_controlled_variables.shape[1] + 1 # + 1 for initial state
+        elif self.transformer_type == 'vae_encoder':
+            max_T = actions.shape[1] + next_controlled_variables.shape[1] + 1 # + 1 for initial state
+        else:
+            max_T = self.context_len + 1 # + 1 for initial state
+
+        positions = jnp.arange(max_T)[None,:].repeat(states.shape[0], axis=0)
+        positional_embeddings = nn.Embed(
+            num_embeddings=max_T,
+            features=self.h_dim)(positions)
+
+        initial_state_embedding = nn.Dense(
+            self.h_dim,
+            dtype=self.dtype,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init)(states[:,0,:]) 
+        initial_state_embedding += positional_embeddings[:,0,:]
+
+        if self.transformer_type == 'encoder': # infer latent variable z_0 given s_0, y_1, ..., y_H
+
+            # condiiton the encoder on the horizon length
+            # currently conditioning by adding horizon embeddings
+            # an alternative is to add a seperate horizon embedding token and allow other variables to attend to it
+            initial_state_embedding += horizon_embeddings.squeeze()
+            
+            controlled_variables_embeddings = nn.Dense(
+                self.h_dim,
+                dtype=self.dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init)(next_controlled_variables) 
+            controlled_variables_embeddings += positional_embeddings[:,1:,:] 
+            controlled_variables_embeddings += horizon_embeddings
+            
+            # concatenate initial state and controlled variables
+            # (s_0, y_1, ..., y_H)
+            # (B x [T + 1] x h_dim)
+            h = jnp.concatenate((initial_state_embedding[:,None,:], controlled_variables_embeddings), axis=1)
+
+        elif self.transformer_type == 'vae_encoder': # infer latent variable z_0 given s_0, a_0, ..., a_H-1
+
+            # condiiton the encoder on the horizon length
+            # currently conditioning by adding horizon embeddings
+            # an alternative is to add a seperate horizon embedding token and allow other variables to attend to it
+            initial_state_embedding += horizon_embeddings.squeeze()
+
+            controlled_variables_embeddings = nn.Dense(
+                self.h_dim,
+                dtype=self.dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init)(next_controlled_variables) 
+            controlled_variables_embeddings += positional_embeddings[:,1:next_controlled_variables.shape[1]+1:,:] 
+            controlled_variables_embeddings += horizon_embeddings
+            
+            action_embeddings = nn.Dense(
+                self.h_dim,
+                dtype=self.dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init)(actions) 
+            action_embeddings += positional_embeddings[:,next_controlled_variables.shape[1]+1:,:] 
+            action_embeddings += horizon_embeddings
+
+            # stacked = jnp.stack([controlled_variables_embeddings, action_embeddings], axis=2)
+            # # Step 2: Reshape to interleave along axis=1 → (B, 2T, D)
+            # interleaved = stacked.reshape(stacked.shape[0], -1, stacked.shape[-1])
+            # # Step 3: Expand initial_state_embedding to shape (B, 1, D)
+            # initial_expanded = initial_state_embedding[:, None, :]
+            # # Step 4: Concatenate along time axis
+            # h = jnp.concatenate([initial_expanded, interleaved], axis=1)
+                        
+            # concatenate initial state and actions
+            # (s_0, a_0, ..., a_H-1)
+            # (B x [T + 1] x h_dim)
+            h = jnp.concatenate((initial_state_embedding[:,None,:], controlled_variables_embeddings, action_embeddings), axis=1)
+
+        elif self.transformer_type == 'precoder' or self.transformer_type == 'action_decoder': # generate action variable a_h given s_0, z_0, a_0, ..., a_h-1
+            
+            initial_state_embedding += horizon_embeddings.squeeze()
+            
+            latent_embedding = nn.Dense(
+                self.h_dim,
+                dtype=self.dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init)(latent) 
+            latent_embedding += positional_embeddings[:,1,:]
+            latent_embedding += horizon_embeddings.squeeze()
+            
+            action_embeddings = nn.Dense(
+                self.h_dim,
+                dtype=self.dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init)(actions[:,:-1,:])
+            action_embeddings += positional_embeddings[:,2:,:] 
+            action_embeddings += horizon_embeddings
+            
+            # concatenate initial state, latent and actions
+            # (s_0, z_0, a_0, ..., a_H-1)
+            # (B x [T + 1] x h_dim)
+            h = jnp.concatenate((initial_state_embedding[:,None,:], latent_embedding[:,None,:], action_embeddings), axis=1)
+
+        elif self.transformer_type == 'dynamics': # predict next controlled variables given s_0, a_0, ..., a_H-1
+
+            # initial_state_embedding += horizon_embeddings # dynamics don't depend on horizon
+           
+            action_embeddings = nn.Dense(
+                self.h_dim,
+                dtype=self.dtype,
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init)(actions) + positional_embeddings[:,1:,:]
+            
+            # concatenate initial state and actions
+            # (s_0, a_0, a_1 ..., a_H-1)
+            # (B x [T + 1] x h_dim)
+            h = jnp.concatenate((initial_state_embedding[:,None,:], action_embeddings), axis=1)
+
+        h = nn.LayerNorm(dtype=self.dtype)(h)
+
+        arange = jnp.arange(max_T)[None, :]
+        if self.transformer_type == 'encoder':
+            padded_mask = jnp.concatenate((jnp.ones((B,1)),
+                                           arange[:,:next_controlled_variables.shape[1]] < horizon),
+                                           axis=-1).astype(jnp.float32)[..., None]
+        elif self.transformer_type == 'vae_encoder':
+            padded_mask = jnp.concatenate((jnp.ones((B,1)),
+                                           arange[:,:next_controlled_variables.shape[1]] < horizon,
+                                           arange[:,:actions.shape[1]] < horizon),
+                                           axis=-1).astype(jnp.float32)[..., None]
+        else:
+            padded_mask = jnp.zeros(1) # dummy
+        # transformer and prediction
+        for _ in range(self.n_blocks):
+            h = Block(
+                h_dim=self.h_dim,
+                max_T=max_T,
+                n_heads=self.n_heads,
+                drop_p=self.drop_p,
+                use_causal_mask=False if (self.transformer_type == 'encoder' or self.transformer_type == 'vae_encoder') else True)(h, padded_mask, deterministic)
+            
+        if self.transformer_type == 'encoder' or self.transformer_type == 'vae_encoder':
+            # Multiply to zero-out unmasked values
+            h_masked = h * padded_mask  # shape (B, T, D)
+
+            # Sum only the masked positions
+            sum_h = jnp.sum(h_masked, axis=1)  # shape (B, D)
+
+            # Count of masked positions per batch
+            count = jnp.sum(padded_mask, axis=1)  # shape (B, 1)
+
+            # Pool (mean) token embeddings
+            h = sum_h / count
+
+            output_dim = next_controlled_variables.shape[1] * self.controlled_variables_dim * 2
+        elif self.transformer_type == 'precoder':
+            h = h[:, 1:]
+            output_dim = self.act_dim
+        elif self.transformer_type == 'action_decoder':
+            h = h[:, 1:]
+            # smooth hidden representations
+            # if self.apply_conv:
+            #     h = nn.Conv(features=self.h_dim, kernel_size=7, padding="SAME")(h) # kernel_size=3,5,7
+            output_dim = self.act_dim * 2
+        elif self.transformer_type == 'dynamics':
+            h = h[:, -next_controlled_variables.shape[1]:]
+            output_dim = self.controlled_variables_dim * 2
+            
+        # get outputs
+        output = nn.Dense(
+            output_dim,
+            dtype=self.dtype,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init)(h)
+        
+        # if self.transformer_type == 'action_decoder' and self.apply_conv:
+        #     x_mean, x_log_std = jnp.split(output, 2, axis=-1)
+        #     # smooth mean actions
+        #     x_mean = nn.Conv(features=self.act_dim, kernel_size=7, padding="SAME", feature_group_count=self.act_dim)(x_mean) # kernel_size=3,5,7
+        #     output = jnp.concatenate([x_mean, x_log_std], axis=-1)
+
+        return output

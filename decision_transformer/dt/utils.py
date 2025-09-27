@@ -35,6 +35,7 @@ class Transition:
     s_t: jnp.ndarray
     a_t: jnp.ndarray
     s_tp1: jnp.ndarray
+    d_s: jnp.ndarray
     s_tm1: jnp.ndarray
     rtg_t: jnp.ndarray
     ts: jnp.ndarray
