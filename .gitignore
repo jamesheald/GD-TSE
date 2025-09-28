@@ -134,3 +134,5 @@ dmypy.json
 dt_runs/**
 wandb/
 data/*.pkl
+outputs/**
+model_outputs/**

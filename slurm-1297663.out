@@ -1,0 +1,6 @@
+Launching a python run
+Sun Sep 28 02:43:32 PM UTC 2025
+Active conda env: /nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312
+/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/bin/python3
+/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/bin/pip
+slurmstepd-gpu-sr670-23: error: *** JOB 1297663 ON gpu-sr670-23 CANCELLED AT 2025-09-28T14:43:43 ***

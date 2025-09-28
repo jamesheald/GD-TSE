@@ -41,10 +41,11 @@ class sinusoidal_pos_emb(nn.Module):
 
         return emb
 
-class AutonomousGRU(nn.Module):
+class GRU_Precoder(nn.Module):
     hidden_size: int
     act_dim: int
     context_len: int
+    autonomous: bool = False
 
     @nn.compact
     def __call__(self, s_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
@@ -70,8 +71,10 @@ class AutonomousGRU(nn.Module):
             rnn_layer = nn.RNN(gru_cell)
 
             # Apply the RNN layer to the inputs
-            # inputs = jnp.zeros((self.context_len,1))
-            inputs = initial_input[None].repeat(self.context_len, axis=0)
+            if self.autonomous:
+                inputs = jnp.zeros((self.context_len,1))
+            else:
+                inputs = initial_input[None].repeat(self.context_len, axis=0)
             _, outputs = rnn_layer(inputs, initial_carry=initial_carry, return_carry=True)
 
             ys = nn.Dense(self.act_dim)(outputs)
@@ -138,13 +141,13 @@ class dynamics(nn.Module):
     h_dims_dynamics: List
     state_dim: int
     drop_out_rates: List
-    learn_std: bool = True
+    learn_dynamics_std: bool = True
     deterministic: bool = False
     
     def setup(self):
 
         self.dynamics = [nn.Sequential([nn.Dense(features=h_dim), nn.LayerNorm(), nn.relu]) for h_dim in self.h_dims_dynamics]
-        if self.learn_std:
+        if self.learn_dynamics_std:
             self.dynamics_out = nn.Dense(features=self.state_dim*2)
         else:
             self.dynamics_out = nn.Dense(features=self.state_dim)
@@ -161,6 +164,12 @@ class dynamics(nn.Module):
                 key, subkey = jax.random.split(key)
                 x = self.dropout[i](x, self.deterministic, subkey)
         x = self.dynamics_out(x)
+
+        if self.learn_dynamics_std:
+            return x
+        else:
+            log_std = jnp.full_like(x, jnp.log(1e-3))
+            return jnp.concatenate([x, log_std], axis=-1)
 
         return x
 

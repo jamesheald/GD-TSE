@@ -1,0 +1,151 @@
+Launching a python run
+Sun Sep 28 12:53:48 PM UTC 2025
+Active conda env: /nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312
+/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/bin/python3
+/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/bin/pip
+2025-09-28 12:53:59.010011: I external/xla/xla/pjrt/pjrt_api.cc:115] GetPjrtApi was found for cuda at /nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/site-packages/jax_plugins/xla_cuda12/xla_cuda_plugin.so
+2025-09-28 12:53:59.010069: I external/xla/xla/pjrt/pjrt_api.cc:93] PJRT_Api is set for device type cuda
+2025-09-28 12:53:59.012791: I external/xla/xla/pjrt/pjrt_api.cc:161] The PJRT plugin has PJRT API version 0.70. The framework PJRT API version is 0.70.
+2025-09-28 12:53:59.219085: I external/xla/xla/service/service.cc:153] XLA service 0x5f0fd4f40a60 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+2025-09-28 12:53:59.219102: I external/xla/xla/service/service.cc:161]   StreamExecutor device (0): NVIDIA A100-SXM4-40GB, Compute Capability 8.0
+2025-09-28 12:53:59.229768: I external/xla/xla/pjrt/pjrt_c_api_client.cc:130] PjRtCApiClient created.
+[CudaDevice(id=0)]
+/nfs/nhome/live/jheald/jax_dt/train_dt.py:48: UserWarning: 
+The version_base parameter is not specified.
+Please specify a compatability version level, or None.
+Will assume defaults for version 1.1
+  @hydra.main(config_path=cfg_path, config_name="config.yaml")
+/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/site-packages/hydra/_internal/hydra.py:119: UserWarning: Future Hydra versions will no longer change working directory at job runtime by default.
+See https://hydra.cc/docs/1.2/upgrades/1.1_to_1.2/changes_to_job_working_dir/ for more information.
+  ret = run_job(
+Device count: 1, process count: 1 (id 0), local device count: 1, devices to be used count: 1
+[2025-09-28 12:54:01,926][OpenGL.acceleratesupport][INFO] - No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+wandb: Currently logged in as: james-heald (james-gatsby) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.20.1
+wandb: Run data is saved locally in /nfs/nhome/live/jheald/jax_dt/outputs/2025-09-28/12-54-00/wandb/run-20250928_125443-kz01hqpx
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run relocate-expert-v1-985440
+wandb: ⭐️ View project at https://wandb.ai/james-gatsby/jax_dt
+wandb: 🚀 View run at https://wandb.ai/james-gatsby/jax_dt/runs/kz01hqpx
+2025-09-28 12:54:56.114283: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-09-28 12:54:57.935126: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot', 16 bytes spill stores, 16 bytes spill loads
+
+2025-09-28 12:55:00.678185: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot', 324 bytes spill stores, 324 bytes spill loads
+
+num_vae_param: 547754
+2025-09-28 12:55:06.158262: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-09-28 12:55:06.158439: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-09-28 12:55:06.158494: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-09-28 12:55:06.158731: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-09-28 12:55:06.158776: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-09-28 12:55:07.127604: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_144', 320 bytes spill stores, 220 bytes spill loads
+
+2025-09-28 12:55:10.612287: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_144', 388 bytes spill stores, 384 bytes spill loads
+
+2025-09-28 12:55:11.864530: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_144', 820 bytes spill stores, 564 bytes spill loads
+
+2025-09-28 12:55:13.303385: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_144', 1736 bytes spill stores, 1312 bytes spill loads
+
+2025-09-28 12:55:13.611165: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_15', 4 bytes spill stores, 4 bytes spill loads
+
+2025-09-28 12:55:20.147094: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_197', 540 bytes spill stores, 540 bytes spill loads
+
+2025-09-28 12:55:21.037509: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_197', 196 bytes spill stores, 200 bytes spill loads
+
+2025-09-28 12:55:22.357252: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_191', 8 bytes spill stores, 8 bytes spill loads
+
+2025-09-28 12:55:25.032660: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_191', 200 bytes spill stores, 200 bytes spill loads
+
+2025-09-28 12:55:25.788980: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_191', 108 bytes spill stores, 108 bytes spill loads
+
+2025-09-28 12:55:26.754191: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_191', 292 bytes spill stores, 292 bytes spill loads
+
+============================================================
+time elapsed: 0:01:37
+train iter: 0
+num of updates: 100
+vae loss: 2.19801
+kl loss: 0.11153
+a decoder loss: 2.08648
+y decoder loss: 0.00000
+mean weights: 0.00000
+mean disagreement losses: 0.00000
+
+saving current model at: /nfs/nhome/live/jheald/jax_dt/model_outputs/2025-09-28/kz01hqpx/vae_model_100.pt
+2025-09-28 12:55:40.956438: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-09-28 12:55:43.357074: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_6', 16 bytes spill stores, 16 bytes spill loads
+
+2025-09-28 12:55:44.916201: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot_6', 324 bytes spill stores, 324 bytes spill loads
+
+/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/subprocess.py:1885: RuntimeWarning: os.fork() was called. os.fork() is incompatible with multithreaded code, and JAX is multithreaded, so this will likely lead to a deadlock.
+  self.pid = _fork_exec(
+Error executing job with overrides: ['state_dep_prior=True', 'learn_dynamics_std=True', 'autonomous=False', 'gamma=0.95', 'n_dynamics_ensembles=5']
+Traceback (most recent call last):
+  File "/nfs/nhome/live/jheald/jax_dt/train_dt.py", line 1145, in train
+    eval_dynamics(vae_training_state.key, _vae_params, dynamics_model.apply, _dynamics_params, total_updates)
+  File "/nfs/nhome/live/jheald/jax_dt/train_dt.py", line 428, in eval_dynamics
+    predicted_obs_traj = get_predicted_obs(obs, key, actions[None], dynamics_params)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/nfs/nhome/live/jheald/jax_dt/train_dt.py", line 409, in get_predicted_obs
+    _, predicted_obs_traj, _, _ = batch_peform_rollout(target_agnostic_obs[None], dynamics_keys, actions, dynamics_params)
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/nfs/nhome/live/jheald/jax_dt/train_dt.py", line 394, in peform_rollout
+    _, (s_curr, s_next_mean, s_dist_params, disagreement) = jax.lax.scan(step_fn, carry, actions)
+                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/nfs/nhome/live/jheald/jax_dt/train_dt.py", line 365, in step_fn
+    s_dist_params = jax.vmap(dynamics_apply, in_axes=(0,None,None,0))(dynamics_params, state, action, dropout_keys)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/nfs/nhome/live/jheald/jax_dt/decision_transformer/dt/networks/networks.py", line 166, in __call__
+    x = self.dynamics_out(x)
+        ^^^^^^^^^^^^^^^^^^^^
+  File "/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/site-packages/flax/linen/linear.py", line 263, in __call__
+    kernel = self.param(
+             ^^^^^^^^^^^
+flax.errors.ScopeParamShapeError: Initializer expected to generate shape (256, 39) but got shape (256, 78) instead for parameter "kernel" in "/dynamics_out". (https://flax.readthedocs.io/en/latest/api_reference/flax.errors.html#flax.errors.ScopeParamShapeError)
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mrelocate-expert-v1-985440[0m at: [34mhttps://wandb.ai/james-gatsby/jax_dt/runs/kz01hqpx[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/run-20250928_125443-kz01hqpx/logs[0m
+Exception ignored in: <function OffScreenViewer.__del__ at 0x77b7aa5d8720>
+Traceback (most recent call last):
+  File "/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/site-packages/gymnasium/envs/mujoco/mujoco_rendering.py", line 204, in __del__
+    self.free()
+  File "/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/site-packages/gymnasium/envs/mujoco/mujoco_rendering.py", line 201, in free
+    self.opengl_context.free()
+  File "/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/site-packages/mujoco/egl/__init__.py", line 131, in free
+    EGL.eglMakeCurrent(EGL_DISPLAY, EGL.EGL_NO_SURFACE,
+  File "/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/site-packages/OpenGL/error.py", line 230, in glCheckError
+    raise self._errorClass(
+OpenGL.raw.EGL._errors.EGLError: EGLError(
+	err = EGL_NOT_INITIALIZED,
+	baseOperation = eglMakeCurrent,
+	cArguments = (
+		<OpenGL._opaque.EGLDisplay_pointer object at 0x77b761566150>,
+		<OpenGL._opaque.EGLSurface_pointer object at 0x77b7ce7a25d0>,
+		<OpenGL._opaque.EGLSurface_pointer object at 0x77b7ce7a25d0>,
+		<OpenGL._opaque.EGLContext_pointer object at 0x77b7ce7a2350>,
+	),
+	result = 0
+)
+Exception ignored in: <function GLContext.__del__ at 0x77b7c7c54d60>
+Traceback (most recent call last):
+  File "/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/site-packages/mujoco/egl/__init__.py", line 138, in __del__
+    self.free()
+  File "/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/site-packages/mujoco/egl/__init__.py", line 131, in free
+    EGL.eglMakeCurrent(EGL_DISPLAY, EGL.EGL_NO_SURFACE,
+  File "/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/site-packages/OpenGL/error.py", line 230, in glCheckError
+    raise self._errorClass(
+OpenGL.raw.EGL._errors.EGLError: EGLError(
+	err = EGL_NOT_INITIALIZED,
+	baseOperation = eglMakeCurrent,
+	cArguments = (
+		<OpenGL._opaque.EGLDisplay_pointer object at 0x77b761566150>,
+		<OpenGL._opaque.EGLSurface_pointer object at 0x77b7ce7a25d0>,
+		<OpenGL._opaque.EGLSurface_pointer object at 0x77b7ce7a25d0>,
+		<OpenGL._opaque.EGLContext_pointer object at 0x77b7ce7a2350>,
+	),
+	result = 0
+)

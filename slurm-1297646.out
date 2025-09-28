@@ -1,0 +1,44 @@
+Launching a python run
+Sun Sep 28 12:40:53 PM UTC 2025
+Active conda env: /nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312
+/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/bin/python3
+/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/bin/pip
+2025-09-28 12:41:00.112432: I external/xla/xla/pjrt/pjrt_api.cc:115] GetPjrtApi was found for cuda at /nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/site-packages/jax_plugins/xla_cuda12/xla_cuda_plugin.so
+2025-09-28 12:41:00.112522: I external/xla/xla/pjrt/pjrt_api.cc:93] PJRT_Api is set for device type cuda
+2025-09-28 12:41:00.117589: I external/xla/xla/pjrt/pjrt_api.cc:161] The PJRT plugin has PJRT API version 0.70. The framework PJRT API version is 0.70.
+2025-09-28 12:41:00.522826: I external/xla/xla/service/service.cc:153] XLA service 0x5e15d0db3720 initialized for platform CUDA (this does not guarantee that XLA will be used). Devices:
+2025-09-28 12:41:00.522849: I external/xla/xla/service/service.cc:161]   StreamExecutor device (0): NVIDIA A100-SXM4-40GB, Compute Capability 8.0
+2025-09-28 12:41:00.534806: I external/xla/xla/pjrt/pjrt_c_api_client.cc:130] PjRtCApiClient created.
+[CudaDevice(id=0)]
+/nfs/nhome/live/jheald/jax_dt/train_dt.py:48: UserWarning: 
+The version_base parameter is not specified.
+Please specify a compatability version level, or None.
+Will assume defaults for version 1.1
+  @hydra.main(config_path=cfg_path, config_name="config.yaml")
+/nfs/nhome/live/jheald/miniconda3/envs/jax_dt_py312/lib/python3.12/site-packages/hydra/_internal/hydra.py:119: UserWarning: Future Hydra versions will no longer change working directory at job runtime by default.
+See https://hydra.cc/docs/1.2/upgrades/1.1_to_1.2/changes_to_job_working_dir/ for more information.
+  ret = run_job(
+Device count: 1, process count: 1 (id 0), local device count: 1, devices to be used count: 1
+[2025-09-28 12:41:06,181][OpenGL.acceleratesupport][INFO] - No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+wandb: Currently logged in as: james-heald (james-gatsby) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.20.1
+wandb: Run data is saved locally in /nfs/nhome/live/jheald/jax_dt/outputs/2025-09-28/12-41-01/wandb/run-20250928_124154-269pilu5
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run relocate-expert-v1-985440
+wandb: ⭐️ View project at https://wandb.ai/james-gatsby/jax_dt
+wandb: 🚀 View run at https://wandb.ai/james-gatsby/jax_dt/runs/269pilu5
+2025-09-28 12:42:10.745717: W external/xla/xla/service/gpu/autotuning/dot_search_space.cc:200] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs?Working around this by using the full hints set instead.
+2025-09-28 12:42:12.804834: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot', 16 bytes spill stores, 16 bytes spill loads
+
+2025-09-28 12:42:15.746491: I external/xla/xla/stream_executor/cuda/subprocess_compilation.cc:346] ptxas warning : Registers are spilled to local memory in function 'gemm_fusion_dot', 324 bytes spill stores, 324 bytes spill loads
+
+num_vae_param: 547754
+Error executing job with overrides: ['state_dep_prior=True', 'learn_dynamics_std=False', 'autonomous=False', 'gamma=0.98', 'n_dynamics_ensembles=5']
+Traceback (most recent call last):
+  File "/nfs/nhome/live/jheald/jax_dt/train_dt.py", line 1079, in train
+UnboundLocalError: cannot access local variable 'save_path' where it is not associated with a value
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mrelocate-expert-v1-985440[0m at: [34mhttps://wandb.ai/james-gatsby/jax_dt/runs/269pilu5[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/run-20250928_124154-269pilu5/logs[0m

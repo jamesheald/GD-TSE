@@ -1,0 +1,68 @@
+seed: 0
+rtg_scale: 1000
+rtg_target: null
+
+dataset_dir: data/
+log_dir: dt_runs/
+
+context_len: 20
+n_blocks: 3
+embed_dim: 128
+n_heads: 1
+dropout_p: 0.
+gradient_clipping: 0.25
+
+n_dynamics_ensembles: 5
+h_dims_dynamics: [256, 256]
+dynamics_dropout_rates: [0., 0.]
+dynamics_dropout_p: 0.
+Markov_dynamics: True
+learn_dynamics_std: False
+
+autonomous: False
+
+dynamics_batch_size: 4096
+vae_batch_size: 1024
+emp_batch_size: 1024
+grad_updates_per_step: 1
+lr: 1e-6 # 1e-4
+wt_decay: 1e-4
+warmup_steps: 10_000
+gamma: 0.95
+horizon_embed_dim: 128
+n_particles: 1
+encoder_dropout_rates: [0., 0.]
+
+num_updates_per_iter: 100
+max_train_iters: 2
+dynamics_save_iters: 2
+vae_save_iters: 2
+emp_save_iters: 2
+
+rm_normalization: False
+max_devices_per_host: null
+
+state_dep_prior: False
+trajectory_version: False
+uncertainty_weight: 0.
+y_decoder_weight: 0.
+info_gain_weight: 1.
+
+resume_dynamics: False
+resume_vae: False
+
+resume_start_time_str: null
+
+# defaults:
+#   - agent: ppo
+#   - env: pregrasp
+#   - override hydra/launcher: h1
+#   - _self_
+
+# hydra:
+#   sweep:
+#     # dir: ${env:HOME}/checkpoints/${exp_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+#     dir: /checkpoint/${env:USER}/mimic/${exp_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+#     subdir: ${wandb.sweep_name_prefix}-${hydra.job.num}
+#   # run:
+#     # dir: .
