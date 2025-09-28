@@ -136,3 +136,4 @@ wandb/
 data/*.pkl
 outputs/**
 model_outputs/**
+slurm-**
