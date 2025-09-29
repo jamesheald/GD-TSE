@@ -101,7 +101,6 @@ def precoder_loss(emp_params: Any,
     posterior_likelihood, info_gain_loss = emp_model.apply(emp_params,
                                                            s_tm1_s_t,
                                                            mask,
-                                                           dynamics_apply,
                                                            dynamics_params,
                                                            emp_key,
                                                            rngs={'dropout': dropout_key})

@@ -155,7 +155,7 @@ class dynamics(nn.Module):
         # if len(jnp.array(self.drop_out_rates > 0.)) > 0:
         self.dropout = [nn.Dropout(rate=layer_i_rate) for layer_i_rate in self.drop_out_rates]
 
-    def __call__(self, obs, actions, key):
+    def __call__(self, obs, actions, key=None):
 
         x = jnp.concatenate((obs, actions), axis=-1)
         for i, fn in enumerate(self.dynamics):

@@ -18,6 +18,65 @@ from flax.linen.initializers import zeros_init, constant
 from jax.lax import stop_gradient
 
 from decision_transformer.dt.networks.networks import GRU_Precoder, MLP, Transformer, FeedForwardModel, sinusoidal_pos_emb, mish
+from decision_transformer.dt.utils import get_mean_and_log_std
+
+def get_rollout_function(dynamics_apply,
+                         n_dynamics_ensembles,
+                         obs_dim,
+                         delta_obs_min,
+                         delta_obs_max,
+                         delta_obs_scale,
+                         delta_obs_shift,
+                         eps=1e-3):
+
+    # sample a state sequence autoregressively from the learned markov dynamics model
+    def peform_rollout(state, key, actions, dynamics_params):
+        
+        def step_fn(carry, action):
+            state, key, dynamics_params = carry
+            key, dropout_key, sample_i_key, sample_s_key = jax.random.split(key, 4)
+            
+            # predict the delta observation
+            dropout_keys = jax.random.split(dropout_key, n_dynamics_ensembles)
+            s_dist_params = jax.vmap(dynamics_apply, in_axes=(0,None,None,0))(dynamics_params, state, action, dropout_keys)
+            s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
+
+            # calculate the info gain
+            al_std = jnp.clip(jnp.sqrt(jnp.square(jnp.exp(s_log_std)).mean(0)), min=1e-3)
+            ep_std = s_mean.std(axis=0)
+            ratio = jnp.square(ep_std / al_std)
+            info_gain = jnp.log(1 + ratio).mean(axis=-1)
+
+            # sample a delta observation from the ensemble
+            idx = jax.random.categorical(sample_i_key, jnp.ones(n_dynamics_ensembles), axis=-1)
+            bounded_bijector = tfb.Chain([
+                tfb.Shift(shift=(delta_obs_min - eps/2)),
+                tfb.Scale(scale=(delta_obs_max - delta_obs_min + eps)),
+                tfb.Sigmoid(),
+            ])
+            s_base_dist = tfd.MultivariateNormalDiag(loc=s_mean[idx], scale_diag=jnp.exp(s_log_std[idx]))
+            s_dist = tfd.TransformedDistribution(distribution=s_base_dist, bijector=bounded_bijector)
+            delta_s = s_dist.sample(seed=sample_s_key)
+
+            # calculate the next observation by adding the delta observation to the current observation
+            delta_s = delta_s * delta_obs_scale + delta_obs_shift
+            s_curr = state[..., obs_dim:]
+            s_next = s_curr + delta_s
+
+            # concatenate the current observation with the next observation to define the state
+            next_state = jnp.concatenate([s_curr, s_next], axis=-1)
+
+            carry = next_state, key, dynamics_params
+            return carry, (s_next, info_gain)
+
+        carry = state, key, dynamics_params
+        _, (next_state, info_gain) = jax.lax.scan(step_fn, carry, actions)
+        
+        return next_state, info_gain
+
+    batch_peform_rollout = jax.vmap(peform_rollout, in_axes=(0,0,0,None))
+
+    return batch_peform_rollout
 
 def make_transformer(state_dim: int,
                      act_dim: int,
@@ -125,6 +184,9 @@ class CLVM(nn.Module): # contextual/conditional/context-conditional latent varia
     n_dynamics_ensembles: int
     horizon_embed_dim: int
     gamma: float
+    h_dims_prior: List
+    h_dims_encoder: List
+    h_dims_GRU: int
     Markov_dynamics: True
     encoder_dropout_rates: List
     trajectory_version: bool = False
@@ -141,26 +203,21 @@ class CLVM(nn.Module): # contextual/conditional/context-conditional latent varia
 
         if self.state_dependent_prior:
             self.prior = MLP(out_dim=self.controlled_variables_dim*2,
-                             h_dims=[256,256],
-                             drop_out_rates=[0., 0.])
+                             h_dims=self.h_dims_prior,
+                             drop_out_rates=[0.,0.])
             
         self.encoder = MLP(out_dim=self.controlled_variables_dim*2,
-                           h_dims=[256,256],
+                           h_dims=self.h_dims_encoder,
                            drop_out_rates=self.encoder_dropout_rates)
 
         self.precoder = GRU_Precoder(act_dim=self.act_dim,
                                      context_len=self.context_len,
-                                     hidden_size=128,
+                                     hidden_size=self.h_dims_GRU,
                                      autonomous=self.autonomous)
         
     def __call__(self, s_t, a_t, y_t, horizon, mask, key):
 
-        def get_mean_and_log_std(x, min_log_std = -20., max_log_std = 2.):
-            x_mean, x_log_std = jnp.split(x, 2, axis=-1)
-            x_log_std = jnp.clip(x_log_std, min_log_std, max_log_std)
-            return x_mean, x_log_std
-
-        key, subkey, dropout_key, sample_h_key, encoder_key = jax.random.split(key, 5)
+        key, subkey, sample_h_key, encoder_key = jax.random.split(key, 4)
         
         ###################### sample future time point from a geometric distribution ###################### 
         
@@ -205,10 +262,7 @@ class CLVM(nn.Module): # contextual/conditional/context-conditional latent varia
         if self.state_dependent_prior:
 
             prior_params = self.prior(s_t[:,0,:])
-            prior_mean, prior_log_std = jnp.split(prior_params, 2, axis=-1)
-            min_log_std = -20.
-            max_log_std = 2.
-            prior_log_std = jnp.clip(prior_log_std, min_log_std, max_log_std)
+            prior_mean, prior_log_std  = get_mean_and_log_std(prior_params)
             dist_z_prior = tfd.MultivariateNormalDiag(loc=prior_mean, scale_diag=jnp.exp(prior_log_std))
 
         else:
@@ -277,12 +331,16 @@ class empowerment(nn.Module):
     drop_p: float
     gamma: float
     n_dynamics_ensembles: int
+    dynamics_apply: Any
     delta_obs_scale: Any
     delta_obs_shift: Any
     delta_obs_min: Any
     delta_obs_max: Any
     horizon_embed_dim: int
     n_particles: int
+    h_dims_prior: List
+    h_dims_encoder: List
+    h_dims_GRU: int
     encoder_dropout_rates: List
     Markov_dynamics: bool = True
     alternate_training: bool = False
@@ -301,16 +359,16 @@ class empowerment(nn.Module):
 
         if self.state_dependent_source:
             self.prior = MLP(out_dim=self.controlled_variables_dim*2,
-                          h_dims=[256,256],
-                          drop_out_rates=[0., 0.])
+                             h_dims=self.h_dims_prior,
+                             drop_out_rates=[0.,0.])
         
         self.precoder = GRU_Precoder(act_dim=self.act_dim,
                                      context_len=self.context_len,
-                                     hidden_size=128,
+                                     hidden_size=self.h_dims_GRU,
                                      autonomous=self.autonomous)
 
         self.encoder = MLP(out_dim=self.controlled_variables_dim*2,
-                    h_dims=[256,256],
+                    h_dims=self.h_dims_encoder,
                     drop_out_rates=self.encoder_dropout_rates)
 
         if self.use_flow:
@@ -318,15 +376,18 @@ class empowerment(nn.Module):
                                 num_bijector_params=2,
                                 num_coupling_layers=2,
                                 z_dim=self.controlled_variables_dim)
+            
+        self.batch_peform_rollout = get_rollout_function(self.dynamics_apply,
+                                                        self.n_dynamics_ensembles,
+                                                        self.state_dim,
+                                                        self.delta_obs_min,
+                                                        self.delta_obs_max,
+                                                        self.delta_obs_scale,
+                                                        self.delta_obs_shift)
 
-    def __call__(self, s_t, mask, dynamics_apply, dynamics_params, key):
+    def __call__(self, s_t, mask, dynamics_params, key):
 
         sample_z_key, encoder_key = jax.random.split(key)
-
-        def get_mean_and_log_std(x, min_log_std = -20., max_log_std = 2.):
-            x_mean, x_log_std = jnp.split(x, 2, axis=-1)
-            x_log_std = jnp.clip(x_log_std, min_log_std, max_log_std)
-            return x_mean, x_log_std
 
         ###################### state-dependent prior ###################### 
 
@@ -354,65 +415,10 @@ class empowerment(nn.Module):
 
         ###################### Markov dynamics ###################### 
 
-        def sample_one_traj(s_t, actions, key, dynamics_params):
-
-            # sample a state sequence autoregressively from the learned markov dynamics model
-            def peform_rollout(state, key, actions, dynamics_params):
-                
-                def step_fn(carry, action):
-                    state, key, dynamics_params = carry
-                    key, dropout_key, sample_i_key, sample_s_key = jax.random.split(key, 4)
-                    
-                    # multiple samples
-                    dropout_keys = jax.random.split(dropout_key, self.n_dynamics_ensembles)
-                    s_dist_params = jax.vmap(dynamics_apply, in_axes=(0,None,None,0))(dynamics_params, state, action, dropout_keys)
-                    # s_dist_params = dynamics_apply(dynamics_params, state, action, dropout_key)
-                    s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
-                    
-                    # disagreement = jnp.var(s_mean, axis=0).mean()
-
-                    al_std = jnp.clip(jnp.sqrt(jnp.square(jnp.exp(s_log_std)).mean(0)), min=1e-3)
-                    ep_std = s_mean.std(axis=0)
-                    ratio = jnp.square(ep_std / al_std)
-                    info_gain = jnp.log(1 + ratio).mean(axis=-1)#.reshape(-1, 1)
-
-                    idx = jax.random.categorical(sample_i_key, jnp.ones(self.n_dynamics_ensembles), axis=-1)
-                    eps = 1e-3
-                    bounded_bijector = tfb.Chain([
-                        tfb.Shift(shift=(self.delta_obs_min-eps/2)),
-                        tfb.Scale(scale=(self.delta_obs_max - self.delta_obs_min + eps)),
-                        tfb.Sigmoid(),
-                    ])
-                    # if self.learn_dynamics_std:
-                    #     s_base_dist = tfd.MultivariateNormalDiag(loc=s_mean[idx], scale_diag=jnp.exp(s_log_std[idx]))
-                    #     s_dist = tfd.TransformedDistribution(distribution=s_base_dist, bijector=bounded_bijector)
-                    #     delta_s = s_dist.sample(seed=sample_s_key)
-                    # else:
-                    #     s_base_dist = tfd.MultivariateNormalDiag(loc=bounded_bijector.forward(s_mean[idx]), scale_diag=jnp.exp(s_log_std[idx]))
-                    #     delta_s = s_base_dist.sample(seed=sample_s_key)
-                    s_base_dist = tfd.MultivariateNormalDiag(loc=s_mean[idx], scale_diag=jnp.exp(s_log_std[idx]))
-                    s_dist = tfd.TransformedDistribution(distribution=s_base_dist, bijector=bounded_bijector)
-                    delta_s = s_dist.sample(seed=sample_s_key)
-
-                    delta_s = delta_s * self.delta_obs_scale + self.delta_obs_shift
-
-                    s_curr = state[...,self.state_dim:]
-                    s_next = s_curr + delta_s
-
-                    next_state = jnp.concatenate([s_curr, s_next], axis=-1)
-
-                    carry = next_state, key, dynamics_params
-                    return carry, (s_next, info_gain)
-
-                carry = state, key, dynamics_params
-                _, (next_state, info_gain) = jax.lax.scan(step_fn, carry, actions)
-                
-                return next_state, info_gain
-            
-            batch_peform_rollout = jax.vmap(peform_rollout, in_axes=(0,0,0,None))
+        def sample_one_traj(s_t, actions, key, dynamics_params):        
 
             dynamics_keys = jax.random.split(key, actions.shape[0])
-            next_state, info_gain = batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions, dynamics_params)
+            next_state, info_gain = self.batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions, dynamics_params)
 
             # y_samp = jnp.take_along_axis(next_state, horizon[..., None]-1, axis=1)[...,self.controlled_variables]
             y_samp = next_state[...,self.controlled_variables]

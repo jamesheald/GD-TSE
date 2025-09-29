@@ -1,3 +1,5 @@
+env_d4rl_name: D4RL/relocate/expert-v2
+
 seed: 0
 rtg_scale: 1000
 rtg_target: null
@@ -19,6 +21,10 @@ dynamics_dropout_p: 0.
 Markov_dynamics: True
 learn_dynamics_std: False
 
+h_dims_prior: [256, 256]
+h_dims_encoder: [256, 256]
+h_dims_GRU: 128
+
 autonomous: False
 
 dynamics_batch_size: 4096
@@ -39,7 +45,6 @@ dynamics_save_iters: 2
 vae_save_iters: 2
 emp_save_iters: 2
 
-rm_normalization: False
 max_devices_per_host: null
 
 state_dep_prior: False
@@ -52,6 +57,8 @@ resume_dynamics: False
 resume_vae: False
 
 resume_start_time_str: null
+
+n_rollouts: 3
 
 # defaults:
 #   - agent: ppo
