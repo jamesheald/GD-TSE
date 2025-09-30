@@ -4,7 +4,7 @@ import numpy as np
 import minari
 from dataclasses import replace
 
-from decision_transformer.dt.utils import ReplayBuffer, discount_cumsum, get_local_devices_to_use, standardise_data
+from src.utils.utils import ReplayBuffer, discount_cumsum, get_local_devices_to_use, standardise_data
 
 def get_dataset(args):
 

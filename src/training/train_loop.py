@@ -7,10 +7,8 @@ from functools import partial
 from datetime import datetime
 import wandb
 
-from decision_transformer.dt.utils import TrainingState, Transition, ReplayBuffer
-from decision_transformer.pmap import is_replicated
-
-# sample_horizon_len  # dynamics_context_len = 1, context_len
+from src.utils.utils import TrainingState, Transition, ReplayBuffer
+from src.pmap.pmap import is_replicated
 
 def create_one_train_iteration(optimizer,
                                grad_fn,

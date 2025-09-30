@@ -8,6 +8,18 @@ import numpy as np
 
 from typing import Any
 
+def get_controlled_variables(args):
+
+    if args.controlled_variable == 'obj_pos':
+        # controlled_variables_dim = 6
+        # controlled_variables = [i for i in range(3)] # hand pos
+        # controlled_variables += [36 + i for i in range(3)] # object pos
+        controlled_variables_dim = 3
+        controlled_variables = [36 + i for i in range(3)] # object pos
+        args.controlled_variables_dim = controlled_variables_dim
+
+    return controlled_variables, args
+
 def standardise_data(x, x_mean, x_std):
     return (x - x_mean) / x_std
 

@@ -14,164 +14,13 @@ import jax.numpy as jnp
 from flax import linen as nn
 import math
 
-from flax.linen.initializers import lecun_normal, zeros
+from flax.linen.initializers import lecun_normal, zeros, zeros_init, constant
 from typing import Any, Callable, List
 
 import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
 tfb = tfp.bijectors
-
-class mish(nn.Module):
-
-    @nn.compact
-    def __call__(self, x):
-
-        return x * nn.tanh(nn.softplus(x))
-
-class sinusoidal_pos_emb(nn.Module):
-    dim: int
-
-    def __call__(self, x):
-        
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = jnp.exp(jnp.arange(half_dim) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = jnp.concatenate((jnp.sin(emb), jnp.cos(emb)), axis = -1)
-
-        return emb
-
-class GRU_Precoder(nn.Module):
-    hidden_size: int
-    act_dim: int
-    context_len: int
-    autonomous: bool = False
-
-    @nn.compact
-    def __call__(self, s_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
-        # s_t: (batch, 1, state_dim) assumed
-        # z_t: (batch, z_dim)
-    
-        def scan_gru(s_t, z_t):
-            
-            # Initial input: (batch, state_dim + z_dim)
-            initial_input = jnp.concatenate([s_t[0, :], z_t], axis=-1)
-
-            # Map to initial hidden state
-            # initial_carry = nn.Dense(self.hidden_size)(initial_input)
-
-            initial_carry = MLP(out_dim=self.hidden_size,
-                                h_dims=[256,256],
-                                drop_out_rates=[0., 0.])(initial_input)
-
-            gru_cell = nn.GRUCell(features=self.hidden_size)
-
-            # Wrap the GRUCell with nn.RNN
-            # cell_size is typically the hidden state size of the cell
-            rnn_layer = nn.RNN(gru_cell)
-
-            # Apply the RNN layer to the inputs
-            if self.autonomous:
-                inputs = jnp.zeros((self.context_len,1))
-            else:
-                inputs = initial_input[None].repeat(self.context_len, axis=0)
-            _, outputs = rnn_layer(inputs, initial_carry=initial_carry, return_carry=True)
-
-            ys = nn.Dense(self.act_dim)(outputs)
-            # ys = nn.Dense(self.act_dim)(jnp.concatenate((initial_input[None,:].repeat(outputs.shape[0], axis=0), outputs), axis=-1))
-            actions = jnp.tanh(ys)
-                
-            return actions  # (T, act_dim)
-
-        # Vectorize across batch
-        actions = jax.vmap(scan_gru)(s_t, z_t)  # (batch, T, act_dim)
-
-        return actions
-
-class MLP(nn.Module):
-    out_dim: int
-    h_dims: List
-    drop_out_rates: List
-    deterministic: bool = False
-    
-    def setup(self):
-
-        self.mlp = [nn.Sequential([nn.Dense(features=h_dim), nn.LayerNorm(), nn.relu]) for h_dim in self.h_dims]
-        self.mlp_out = nn.Dense(features=self.out_dim)
-
-        self.dropout = [nn.Dropout(rate=layer_i_rate) for layer_i_rate in self.drop_out_rates]
-
-    def __call__(self, x, key=None):
-
-        for i, fn in enumerate(self.mlp):
-            x = fn(x)
-            if self.drop_out_rates[i] > 0.:
-                key, subkey = jax.random.split(key)
-                x = self.dropout[i](x, self.deterministic, subkey)
-        x = self.mlp_out(x)
-
-        return x
-
-class MLP_precoder(nn.Module):
-    act_dim: int
-    context_len: int
-    h_dims: List
-    apply_conv: bool = False
-    
-    def setup(self):
-
-        self.precoder = [nn.Sequential([nn.Dense(features=h_dim), nn.LayerNorm(), nn.relu]) for h_dim in self.h_dims]
-        self.precoder_out = nn.Dense(features=self.context_len*self.act_dim)
-
-    def __call__(self, s_t, z_t):
-
-        x = jnp.concatenate((s_t[:,0,:], z_t), axis=-1)
-        for fn in self.precoder:
-            x = fn(x)
-        # if self.apply_conv:
-            # x = nn.Conv(features=self.h_dims[-1], kernel_size=7, padding="SAME")(h) # kernel_size=3,5,7
-        x = self.precoder_out(x).reshape(-1,self.context_len,self.act_dim)
-        if self.apply_conv:
-            x = nn.Conv(features=self.act_dim, kernel_size=7, padding="SAME", feature_group_count=self.act_dim)(x) # kernel_size=3,5,7
-        actions = jnp.tanh(x)
-
-        return actions
-
-class dynamics(nn.Module):
-    h_dims_dynamics: List
-    state_dim: int
-    drop_out_rates: List
-    learn_dynamics_std: bool = True
-    deterministic: bool = False
-    
-    def setup(self):
-
-        self.dynamics = [nn.Sequential([nn.Dense(features=h_dim), nn.LayerNorm(), nn.relu]) for h_dim in self.h_dims_dynamics]
-        if self.learn_dynamics_std:
-            self.dynamics_out = nn.Dense(features=self.state_dim*2)
-        else:
-            self.dynamics_out = nn.Dense(features=self.state_dim)
-        
-        # if len(jnp.array(self.drop_out_rates > 0.)) > 0:
-        self.dropout = [nn.Dropout(rate=layer_i_rate) for layer_i_rate in self.drop_out_rates]
-
-    def __call__(self, obs, actions, key=None):
-
-        x = jnp.concatenate((obs, actions), axis=-1)
-        for i, fn in enumerate(self.dynamics):
-            x = fn(x)
-            if self.drop_out_rates[i] > 0.:
-                key, subkey = jax.random.split(key)
-                x = self.dropout[i](x, self.deterministic, subkey)
-        x = self.dynamics_out(x)
-
-        if self.learn_dynamics_std:
-            return x
-        else:
-            log_std = jnp.full_like(x, jnp.log(1e-3))
-            return jnp.concatenate([x, log_std], axis=-1)
-
-        return x
+import distrax
 
 @dataclasses.dataclass
 class FeedForwardModel:
@@ -500,3 +349,275 @@ class Transformer(nn.Module):
         #     output = jnp.concatenate([x_mean, x_log_std], axis=-1)
 
         return output
+
+def make_transformer(state_dim: int,
+                     act_dim: int,
+                     controlled_variables_dim: int,
+                     n_blocks: int,
+                     h_dim: int,
+                     context_len: int,
+                     n_heads: int,
+                     drop_p: float,
+                     transformer_type: str) -> Transformer:
+    """Creates a Transformer model.
+    Args:
+        state_dim: dimension of state
+        act_dim: dimension of action
+        n_blocks: number of attention blocks in transformer
+        h_dim: size of hidden unit for liner layers
+        context_len: length of context
+        n_heads: number of attention heads in in transformer
+        drop_p: dropout rate
+    Returns:
+        a model
+    """
+    module = Transformer(
+        state_dim=state_dim,
+        act_dim=act_dim,
+        controlled_variables_dim=controlled_variables_dim,
+        n_blocks=n_blocks,
+        h_dim=h_dim,
+        context_len=context_len,
+        n_heads=n_heads,
+        drop_p=drop_p,
+        transformer_type=transformer_type)
+
+    return module
+
+
+def make_transformer_networks(state_dim: int,
+                              act_dim: int,
+                              controlled_variables_dim: int,
+                              n_blocks: int,
+                              h_dim: int,
+                              context_len: int,
+                              n_heads: int,
+                              drop_p: float,
+                              trajectory_version: bool,
+                              transformer_type: str) -> FeedForwardModel:
+    batch_size = 1
+    dummy_timesteps = jnp.zeros((batch_size, context_len), dtype=jnp.int32)
+    dummy_states = jnp.zeros((batch_size, context_len, state_dim*2))
+    dummy_actions = jnp.zeros((batch_size, context_len, act_dim))
+    if trajectory_version:
+        dummy_latent = jnp.zeros((batch_size, context_len * controlled_variables_dim))
+    else:
+        dummy_latent = jnp.zeros((batch_size, controlled_variables_dim))
+    if trajectory_version or transformer_type=='dynamics':
+        dummy_controlled_variables = jnp.zeros((batch_size, context_len, controlled_variables_dim))
+    else:
+        dummy_controlled_variables = jnp.zeros((batch_size, 1, controlled_variables_dim))
+    dummy_rtg = jnp.zeros((batch_size, context_len, 1))
+    dummy_horizon = jnp.zeros((batch_size, 1), dtype=jnp.int32)
+    deterministic = False
+
+    def transformer_model_fn():
+        class TransformerModule(nn.Module):
+            @nn.compact
+            def __call__(self,
+                         timesteps: jnp.ndarray,
+                         states: jnp.ndarray,
+                         latent: jnp.ndarray,
+                         actions: jnp.ndarray,
+                         next_controlled_variables: jnp.ndarray,
+                         returns_to_go: jnp.ndarray,
+                         horizon: jnp.ndarray,
+                         deterministic):
+                outputs = make_transformer(
+                    state_dim=state_dim,
+                    act_dim=act_dim,
+                    controlled_variables_dim=controlled_variables_dim,
+                    n_blocks=n_blocks,
+                    h_dim=h_dim,
+                    context_len=context_len,
+                    n_heads=n_heads,
+                    drop_p=drop_p,
+                    transformer_type=transformer_type)(timesteps, states, latent, actions, next_controlled_variables, returns_to_go, horizon, deterministic)
+                return outputs
+
+        transformer_module = TransformerModule()
+        transformer = FeedForwardModel(
+            init=lambda key: transformer_module.init(
+                key, dummy_timesteps, dummy_states, dummy_latent, dummy_actions, dummy_controlled_variables, dummy_rtg, dummy_horizon, deterministic),
+            apply=transformer_module.apply)
+        return transformer
+    return transformer_model_fn()
+
+class flow_model(nn.Module):
+    h_dims_conditioner: int
+    num_bijector_params: int
+    num_coupling_layers: int
+    z_dim: int
+
+    def setup(self):
+
+        # final linear layer of each conditioner initialised to zero so that the flow is initialised to the identity function
+        self.conditioners = [nn.Sequential([nn.Dense(features=self.h_dims_conditioner), nn.relu,\
+                                            nn.Dense(features=self.h_dims_conditioner), nn.relu,\
+                                            nn.Dense(features=self.num_bijector_params*self.z_dim, bias_init=constant(jnp.log(jnp.exp(1.)-1.)), kernel_init=zeros_init())])
+                             for layer_i in range(self.num_coupling_layers)]
+        
+    def __call__(self):
+
+        def make_flow():
+        
+            mask = jnp.arange(self.z_dim) % 2 # every second element is masked
+            mask = mask.astype(bool)
+
+            def bijector_fn(params):
+                shift, arg_soft_plus = jnp.split(params, 2, axis=-1)
+                return distrax.ScalarAffine(shift=shift-jnp.log(jnp.exp(1.)-1.), scale=jax.nn.softplus(arg_soft_plus)+1e-3)
+        
+            layers = []
+            for layer_i in range(self.num_coupling_layers):
+                layer = distrax.MaskedCoupling(mask=mask, bijector=bijector_fn, conditioner=self.conditioners[layer_i])
+                layers.append(layer)
+                mask = jnp.logical_not(mask) # flip mask after each layer
+            
+            # return distrax.Inverse(distrax.Chain(layers)) # invert the flow so that the `forward` method is called with `log_prob`
+            return distrax.Chain(layers)
+
+        return make_flow()
+
+class mish(nn.Module):
+
+    @nn.compact
+    def __call__(self, x):
+
+        return x * nn.tanh(nn.softplus(x))
+
+class sinusoidal_pos_emb(nn.Module):
+    dim: int
+
+    def __call__(self, x):
+        
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = jnp.exp(jnp.arange(half_dim) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = jnp.concatenate((jnp.sin(emb), jnp.cos(emb)), axis = -1)
+
+        return emb
+
+class GRU_Precoder(nn.Module):
+    hidden_size: int
+    act_dim: int
+    context_len: int
+    autonomous: bool = False
+
+    @nn.compact
+    def __call__(self, s_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
+        # s_t: (batch, 1, state_dim) assumed
+        # z_t: (batch, z_dim)
+    
+        def scan_gru(s_t, z_t):
+            
+            # Initial input: (batch, state_dim + z_dim)
+            initial_input = jnp.concatenate([s_t[0, :], z_t], axis=-1)
+
+            # Map to initial hidden state
+            # initial_carry = nn.Dense(self.hidden_size)(initial_input)
+
+            initial_carry = MLP(out_dim=self.hidden_size,
+                                h_dims=[256,256],
+                                drop_out_rates=[0., 0.])(initial_input)
+
+            gru_cell = nn.GRUCell(features=self.hidden_size)
+
+            # Wrap the GRUCell with nn.RNN
+            # cell_size is typically the hidden state size of the cell
+            rnn_layer = nn.RNN(gru_cell)
+
+            # Apply the RNN layer to the inputs
+            if self.autonomous:
+                inputs = jnp.zeros((self.context_len,1))
+            else:
+                inputs = initial_input[None].repeat(self.context_len, axis=0)
+            _, outputs = rnn_layer(inputs, initial_carry=initial_carry, return_carry=True)
+
+            ys = nn.Dense(self.act_dim)(outputs)
+            # ys = nn.Dense(self.act_dim)(jnp.concatenate((initial_input[None,:].repeat(outputs.shape[0], axis=0), outputs), axis=-1))
+            actions = jnp.tanh(ys)
+                
+            return actions  # (T, act_dim)
+
+        # Vectorize across batch
+        actions = jax.vmap(scan_gru)(s_t, z_t)  # (batch, T, act_dim)
+
+        return actions
+
+class MLP(nn.Module):
+    out_dim: int
+    h_dims: List
+    drop_out_rates: List
+    deterministic: bool = False
+    
+    def setup(self):
+
+        self.mlp = [nn.Sequential([nn.Dense(features=h_dim), nn.LayerNorm(), nn.relu]) for h_dim in self.h_dims]
+        self.mlp_out = nn.Dense(features=self.out_dim)
+
+        self.dropout = [nn.Dropout(rate=layer_i_rate) for layer_i_rate in self.drop_out_rates]
+
+    def __call__(self, x, key=None):
+
+        for i, fn in enumerate(self.mlp):
+            x = fn(x)
+            if self.drop_out_rates[i] > 0.:
+                key, subkey = jax.random.split(key)
+                x = self.dropout[i](x, self.deterministic, subkey)
+        x = self.mlp_out(x)
+
+        return x
+
+class MLP_precoder(nn.Module):
+    act_dim: int
+    context_len: int
+    h_dims: List
+    apply_conv: bool = False
+    
+    def setup(self):
+
+        self.precoder = [nn.Sequential([nn.Dense(features=h_dim), nn.LayerNorm(), nn.relu]) for h_dim in self.h_dims]
+        self.precoder_out = nn.Dense(features=self.context_len*self.act_dim)
+
+    def __call__(self, s_t, z_t):
+
+        x = jnp.concatenate((s_t[:,0,:], z_t), axis=-1)
+        for fn in self.precoder:
+            x = fn(x)
+        # if self.apply_conv:
+            # x = nn.Conv(features=self.h_dims[-1], kernel_size=7, padding="SAME")(h) # kernel_size=3,5,7
+        x = self.precoder_out(x).reshape(-1,self.context_len,self.act_dim)
+        if self.apply_conv:
+            x = nn.Conv(features=self.act_dim, kernel_size=7, padding="SAME", feature_group_count=self.act_dim)(x) # kernel_size=3,5,7
+        actions = jnp.tanh(x)
+
+        return actions
+
+class dynamics(nn.Module):
+    args: Any
+    d_args: Any
+    
+    def setup(self):
+
+        self.dynamics = [nn.Sequential([nn.Dense(features=h_dim), nn.LayerNorm(), nn.relu]) for h_dim in self.args.h_dims_dynamics]
+        if self.args.learn_dynamics_std:
+            self.dynamics_out = nn.Dense(features=self.d_args['obs_dim']*2)
+        else:
+            self.dynamics_out = nn.Dense(features=self.d_args['obs_dim'])
+
+    def __call__(self, obs, actions, key=None):
+
+        x = jnp.concatenate((obs, actions), axis=-1)
+        for i, fn in enumerate(self.dynamics):
+            x = fn(x)
+        x = self.dynamics_out(x)
+
+        if self.args.learn_dynamics_std:
+            return x
+        else:
+            log_std = jnp.full_like(x, jnp.log(1e-3))
+            return jnp.concatenate([x, log_std], axis=-1)
+
+        return x

@@ -1,12 +1,8 @@
-from setuptools import find_packages
-from setuptools import setup
+from setuptools import setup, find_packages
 
-install_requires = []
-
-setup(name='decision_transformer',
-      version='0.0.1',
-      description='JAXß Decision Transformer',
-      license='MIT License',
-      packages=find_packages(),
-      install_requires=install_requires,
+setup(
+    name='GD-TSE',
+    version='0.0.1',
+    packages=find_packages(where="src"),  # find all packages in src/
+    package_dir={"": "src"},              # tell setuptools that packages are under src/
 )

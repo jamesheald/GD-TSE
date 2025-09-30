@@ -11,15 +11,85 @@ tfb = tfp.bijectors
 import imageio
 from matplotlib import pyplot as plt
 
-from decision_transformer.dt.models.models import get_rollout_function
-from decision_transformer.dt.utils import get_mean_and_log_std, standardise_data, unstandardise_data
+from src.utils.utils import get_mean_and_log_std, standardise_data, unstandardise_data
 
-###################################### evaluation ###################################### 
+def get_rollout_function(dynamics_apply,
+                         n_dynamics_ensembles,
+                         obs_dim,
+                         delta_obs_min,
+                         delta_obs_max,
+                         delta_obs_scale,
+                         delta_obs_shift,
+                         eps=1e-3):
+    """
+    Create a batched rollout function using an ensemble of dynamics models.
 
-def get_actions(obs, key, precoder_params, args, d_args, prior_params, precoder_apply, prior_apply):
+    Args:
+        dynamics_apply (Callable): Function to compute dynamics predictions for a single ensemble member.
+        n_dynamics_ensembles (int): Number of ensemble dynamics models.
+        obs_dim (int): Dimensionality of the observation/state vector.
+        delta_obs_min (float): Minimum bound for delta observation (used in bijector).
+        delta_obs_max (float): Maximum bound for delta observation (used in bijector).
+        delta_obs_scale (float): Scaling factor applied to delta observation.
+        delta_obs_shift (float): Shift added to delta observation after scaling.
+        eps (float, optional): Small epsilon to prevent numerical issues. Defaults to 1e-3.
 
-    # precoder_apply
-    # prior_apply
+    Returns:
+        Callable: A vectorized rollout function `batch_peform_rollout(state, key, actions, dynamics_params)` that returns:
+            next_state (array): Next states for each step in the rollout.
+            info_gain (array): Information gain for each step in the rollout.
+    """
+
+    # sample a state sequence autoregressively from the learned markov dynamics model
+    def peform_rollout(state, key, actions, dynamics_params):
+        
+        def step_fn(carry, action):
+            state, key, dynamics_params = carry
+            key, dropout_key, sample_i_key, sample_s_key = jax.random.split(key, 4)
+            
+            # predict the delta observation
+            dropout_keys = jax.random.split(dropout_key, n_dynamics_ensembles)
+            s_dist_params = jax.vmap(dynamics_apply, in_axes=(0,None,None,0))(dynamics_params, state, action, dropout_keys)
+            s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
+
+            # calculate the info gain
+            al_std = jnp.clip(jnp.sqrt(jnp.square(jnp.exp(s_log_std)).mean(0)), min=1e-3)
+            ep_std = s_mean.std(axis=0)
+            ratio = jnp.square(ep_std / al_std)
+            info_gain = jnp.log(1 + ratio).mean(axis=-1)
+
+            # sample a delta observation from the ensemble
+            idx = jax.random.categorical(sample_i_key, jnp.ones(n_dynamics_ensembles), axis=-1)
+            bounded_bijector = tfb.Chain([
+                tfb.Shift(shift=(delta_obs_min - eps/2)),
+                tfb.Scale(scale=(delta_obs_max - delta_obs_min + eps)),
+                tfb.Sigmoid(),
+            ])
+            s_base_dist = tfd.MultivariateNormalDiag(loc=s_mean[idx], scale_diag=jnp.exp(s_log_std[idx]))
+            s_dist = tfd.TransformedDistribution(distribution=s_base_dist, bijector=bounded_bijector)
+            delta_s = s_dist.sample(seed=sample_s_key)
+
+            # calculate the next observation by adding the delta observation to the current observation
+            delta_s = delta_s * delta_obs_scale + delta_obs_shift
+            s_curr = state[..., obs_dim:]
+            s_next = s_curr + delta_s
+
+            # concatenate the current observation with the next observation to define the state
+            next_state = jnp.concatenate([s_curr, s_next], axis=-1)
+
+            carry = next_state, key, dynamics_params
+            return carry, (s_next, info_gain)
+
+        carry = state, key, dynamics_params
+        _, (next_state, info_gain) = jax.lax.scan(step_fn, carry, actions)
+        
+        return next_state, info_gain
+
+    batch_peform_rollout = jax.vmap(peform_rollout, in_axes=(0,0,0,None))
+
+    return batch_peform_rollout
+
+def sample_actions(obs, key, precoder_params, args, d_args, prior_params, precoder_apply, prior_apply):
 
     # make hand and ball position relative to initial position of hand
     target_agnostic_obs = obs - np.concatenate((np.zeros(33),
@@ -28,7 +98,7 @@ def get_actions(obs, key, precoder_params, args, d_args, prior_params, precoder_
     target_agnostic_obs = standardise_data(target_agnostic_obs, d_args['obs_mean'], d_args['obs_std'])
     target_agnostic_obs = jnp.concatenate((target_agnostic_obs, target_agnostic_obs), axis=-1)
 
-    if args.state_dep_prior:
+    if args.state_dependent_prior:
     
         # state-dependent prior
         prior_z_params = jax.jit(prior_apply)(prior_params, target_agnostic_obs[None])
@@ -50,11 +120,13 @@ def get_actions(obs, key, precoder_params, args, d_args, prior_params, precoder_
 
     return actions[0,:,:]
 
-def eval_model(model, params, key, minari_env, args, d_args, precoder_apply, prior_apply, loop='open'):
+###################################### evaluate action generator ###################################### 
+
+def eval_action_generator(model, params, key, minari_env, args, d_args, precoder_apply, prior_apply, loop='open'):
 
     key, actions_key = jax.random.split(key)
 
-    if args.state_dep_prior:
+    if args.state_dependent_prior:
         prior_params = {'params': params['params']['prior']}
     else:
         prior_params = None
@@ -65,7 +137,7 @@ def eval_model(model, params, key, minari_env, args, d_args, precoder_apply, pri
     for rollout in range(n_rollouts):
         obs, _ = minari_env.reset()
         frames = []
-        actions = get_actions(obs, actions_key, precoder_params, args, d_args, prior_params, precoder_apply, prior_apply)
+        actions = sample_actions(obs, actions_key, precoder_params, args, d_args, prior_params, precoder_apply, prior_apply)
         for t in range(args.context_len):
             frames.append(minari_env.render())
             obs, rew, terminated, truncated, info = minari_env.step(actions[t,:])
@@ -85,16 +157,16 @@ def eval_model(model, params, key, minari_env, args, d_args, precoder_apply, pri
 
     return key
 
-###################################### evaluate dyanmics ###################################### 
+###################################### evaluate learned dyanmics model ###################################### 
 
-def eval_dynamics(args, d_args, key, dynamics_apply, dynamics_params, minari_dataset, minari_env, learned_minari_env, params=None, precoder_apply=None, prior_apply=None):
+def eval_dynamics_model(args, d_args, key, dynamics_apply, dynamics_params, minari_dataset, minari_env, learned_minari_env, params=None, precoder_apply=None, prior_apply=None):
 
     if params is None:
         prior_params = None
         encoder_params = None
         precoder_params = None
     else:
-        if args.state_dep_prior:
+        if args.state_dependent_prior:
             prior_params = {'params': params['params']['prior']}
         else:
             prior_params = None
@@ -144,7 +216,7 @@ def eval_dynamics(args, d_args, key, dynamics_apply, dynamics_params, minari_dat
 
         if precoder_params is not None:
             # generate actions via precoder
-            actions = get_actions(obs, precoder_key, precoder_params, args, d_args, prior_params, precoder_apply, prior_apply)
+            actions = sample_actions(obs, precoder_key, precoder_params, args, d_args, prior_params, precoder_apply, prior_apply)
         else:
             # use actions from the original dataset if no precoder available
             actions = minari_dataset[rollout].actions[:50, :]

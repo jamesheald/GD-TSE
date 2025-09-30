@@ -15,15 +15,14 @@ from datetime import datetime
 import hydra
 from omegaconf import DictConfig
 
-from decision_transformer.dt.networks.networks import dynamics, MLP, GRU_Precoder
-from decision_transformer.dt.models.models import CLVM, empowerment
-from decision_transformer.dt.utils import get_local_devices_to_use, save_params, load_params
-from decision_transformer.pmap import synchronize_hosts
-from scripts.train_loop import create_one_train_iteration
-from scripts.losses.losses import dynamics_loss, CLVM_loss, precoder_loss
-from scripts.initialise_model import get_training_state
-from scripts.get_data import get_dataset
-from scripts.evaluate import eval_dynamics, eval_model
+from src.networks import dynamics, MLP, GRU_Precoder
+from src.models import CLVM, empowerment
+from src.training import get_training_state, create_one_train_iteration
+from src.losses import dynamics_loss, CLVM_loss, precoder_loss
+from src.data import get_dataset
+from src.rollout import eval_dynamics_model, eval_action_generator
+from src.pmap import synchronize_hosts
+from src.utils import get_local_devices_to_use, get_controlled_variables, save_params, load_params
 
 cfg_path = os.path.dirname(__file__)
 cfg_path = os.path.join(cfg_path, 'conf')
@@ -34,12 +33,7 @@ def train(args: DictConfig):
     timestamp = datetime.now().strftime("%Y-%m-%d")
     BASE_SAVE_PATH = '/nfs/nhome/live/jheald/jax_dt/model_outputs'
 
-    # controlled_variables_dim = 6
-    # controlled_variables = [i for i in range(3)] # hand pos
-    # controlled_variables += [36 + i for i in range(3)] # object pos
-    controlled_variables_dim = 3
-    controlled_variables = [36 + i for i in range(3)] # object pos
-
+    # set random seeds
     seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
@@ -47,37 +41,13 @@ def train(args: DictConfig):
 
     local_devices_to_use = get_local_devices_to_use(args)
 
+    controlled_variables, args = get_controlled_variables(args)
+
     replay_buffer, minari_dataset, minari_env, learned_minari_env, d_args = get_dataset(args)
 
     ###################################### dynamics training ###################################### 
 
-    dynamics_model = dynamics(
-        h_dims_dynamics=args.h_dims_dynamics,
-        state_dim=d_args['obs_dim'],
-        drop_out_rates=args.dynamics_dropout_rates,
-        learn_dynamics_std=args.learn_dynamics_std,
-    )
-
-    # if args.resume_start_time_str is not None and args.resume_dynamics is False:
-    # if True:
-
-    # # load_path = os.path.join(BASE_SAVE_PATH, '2025-09-28', '5gpmag7s') # learn_dynamics_std=False
-    # load_path = os.path.join(BASE_SAVE_PATH, '2025-09-28', '67j25zf6') # learn_dynamics_std=True
-    # total_updates = 100000
-    # load_model_path = os.path.join(load_path, "dynamics_model" + f"_{total_updates}.pt")
-    # _dynamics_params = load_params(load_model_path)
-
-    # wandb_run = wandb.init(
-    #         name=f'{args.env_d4rl_name}-{random.randint(int(1e5), int(1e6) - 1)}',
-    #         group=args.env_d4rl_name,
-    #         project='jax_dt',
-    #         config=dict(args)
-    #     )
-    
-    # save_path = os.path.join(BASE_SAVE_PATH, timestamp, wandb_run.id)
-    # os.makedirs(save_path, exist_ok=True)
-
-    # else:
+    dynamics_model = dynamics(args, d_args)
 
     key_dropout, subkey, key = jax.random.split(key, 3)
     dummy_states = jnp.zeros((1, d_args['obs_dim']))
@@ -132,7 +102,7 @@ def train(args: DictConfig):
         if i_train_iter % args.dynamics_save_iters == 0 or i_train_iter == args.max_train_iters - 1:
 
             # render trajectories
-            key = eval_dynamics(args, d_args, key, dynamics_model.apply, _dynamics_params, minari_dataset, minari_env, learned_minari_env)
+            key = eval_dynamics_model(args, d_args, key, dynamics_model.apply, _dynamics_params, minari_dataset, minari_env, learned_minari_env)
 
             save_current_model_path = save_model_path + f"_{total_updates}.pt"
             print("saving current model at: " + save_current_model_path)
@@ -144,31 +114,10 @@ def train(args: DictConfig):
 
     ###################################### CLVM training ###################################### 
 
-    vae_model = CLVM(
-        state_dim=d_args['obs_dim'],
-        act_dim=d_args['act_dim'],
-        controlled_variables=controlled_variables,
-        controlled_variables_dim=controlled_variables_dim,
-        n_blocks=args.n_blocks ,
-        h_dim=args.embed_dim,
-        context_len=args.context_len,
-        n_heads=args.n_heads,
-        drop_p=args.dropout_p,
-        gamma=args.gamma,
-        state_dependent_prior=args.state_dep_prior,
-        Markov_dynamics=args.Markov_dynamics,
-        n_dynamics_ensembles=args.n_dynamics_ensembles,
-        horizon_embed_dim=args.horizon_embed_dim,
-        trajectory_version=args.trajectory_version,
-        encoder_dropout_rates=args.encoder_dropout_rates,
-        autonomous=args.autonomous,
-        h_dims_prior=args.h_dims_prior,
-        h_dims_encoder=args.h_dims_encoder,
-        h_dims_GRU=args.h_dims_GRU,
-    )
+    vae_model = CLVM(args, d_args, controlled_variables)
 
-    if args.state_dep_prior:
-        prior_apply = MLP(out_dim=controlled_variables_dim*2,
+    if args.state_dependent_prior:
+        prior_apply = MLP(out_dim=args.controlled_variables_dim*2,
                           h_dims=args.h_dims_prior,
                           drop_out_rates=[0.,0.]).apply
     else:
@@ -179,40 +128,10 @@ def train(args: DictConfig):
                                   hidden_size=args.h_dims_GRU,
                                   autonomous=args.autonomous).apply
 
-    # if args.resume_start_time_str is not None and args.resume_vae is False:
-
-    #     total_updates = 25000
-    #     load_model_path = os.path.join(log_dir, "vae_model.pt")
-    #     load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
-    #     vae_params = load_params(load_current_model_path)
-
-    #     wandb.init(
-    #             name=f'{args.env_d4rl_name}-{random.randint(int(1e5), int(1e6) - 1)}',
-    #             group=args.env_d4rl_name,
-    #             project='jax_dt',
-    #             config=dict(args)
-    #         )
-
-    # else:
-
-    #     if args.resume_start_time_str is None or args.resume_vae is False:
-        
-        # else:
-
-        #     vae_optimizer = optax.chain(
-        #         optax.clip(args.gradient_clipping),
-        #         optax.adamw(learning_rate=lr, weight_decay=wt_decay),
-        #     )
-
-        #     total_updates = 300000
-        #     load_model_path = os.path.join(log_dir, "vae_model.pt")
-        #     load_current_model_path = load_model_path[:-3] + f"_{total_updates}.pt"
-        #     vae_params = load_params(load_current_model_path)
-
     subkey, key = jax.random.split(key)
     dummy_states = jnp.zeros((1, args.context_len, d_args['obs_dim']*2))
     dummy_actions = jnp.zeros((1, args.context_len, d_args['act_dim']))
-    dummy_controlled_variables = jnp.zeros((1, args.context_len, controlled_variables_dim))
+    dummy_controlled_variables = jnp.zeros((1, args.context_len, args.controlled_variables_dim))
     dummy_horizon = jnp.zeros((1, 1), dtype=jnp.int32)
     dummy_mask = jnp.zeros((1, args.context_len, 1))
     model_kwargs = {'s_t': dummy_states,
@@ -259,8 +178,8 @@ def train(args: DictConfig):
         if i_train_iter % args.vae_save_iters == 0 or i_train_iter == args.max_train_iters - 1:
 
             # render trajectories
-            key = eval_model('vae', _vae_params, key, minari_env, args, d_args, precoder_apply, prior_apply) # model in ['vae', 'emp']
-            key = eval_dynamics(args, d_args, key, dynamics_model.apply, _dynamics_params, minari_dataset, minari_env, learned_minari_env, _vae_params, precoder_apply, prior_apply)
+            key = eval_action_generator('vae', _vae_params, key, minari_env, args, d_args, precoder_apply, prior_apply) # model in ['vae', 'emp']
+            key = eval_dynamics_model(args, d_args, key, dynamics_model.apply, _dynamics_params, minari_dataset, minari_env, learned_minari_env, _vae_params, precoder_apply, prior_apply)
 
             save_current_model_path = save_model_path + f"_{total_updates}.pt"
             print("saving current model at: " + save_current_model_path)
@@ -272,34 +191,7 @@ def train(args: DictConfig):
 
     ###################################### mutual information training ###################################### 
 
-    emp_model = empowerment(
-        state_dim=d_args['obs_dim'],
-        act_dim=d_args['act_dim'],
-        controlled_variables_dim=controlled_variables_dim,
-        controlled_variables=controlled_variables,
-        n_blocks=args.n_blocks ,
-        h_dim=args.embed_dim,
-        context_len=args.context_len,
-        n_heads=args.n_heads,
-        drop_p=args.dropout_p,
-        gamma=args.gamma,
-        Markov_dynamics=args.Markov_dynamics,
-        state_dependent_source=args.state_dep_prior,
-        delta_obs_scale=d_args['delta_obs_scale'],
-        delta_obs_shift=d_args['delta_obs_shift'],
-        delta_obs_min=d_args['delta_obs_min'],
-        delta_obs_max=d_args['delta_obs_max'],
-        n_dynamics_ensembles=args.n_dynamics_ensembles,
-        horizon_embed_dim=args.horizon_embed_dim,
-        n_particles=args.n_particles,
-        encoder_dropout_rates=args.encoder_dropout_rates,
-        learn_dynamics_std=args.learn_dynamics_std,
-        autonomous=args.autonomous,
-        dynamics_apply=dynamics_model.apply,
-        h_dims_prior=args.h_dims_prior,
-        h_dims_encoder=args.h_dims_encoder,
-        h_dims_GRU=args.h_dims_GRU,
-    )
+    emp_model = empowerment(args, d_args, controlled_variables, dynamics_model.apply)
 
     subkey, key = jax.random.split(key)
     model_kwargs = {'s_t': dummy_states,
@@ -308,11 +200,6 @@ def train(args: DictConfig):
                     'key': subkey}
 
     emp_training_state, emp_optimizer = get_training_state(emp_model, model_kwargs, subkey, args, ensemble_size=1)
-    
-    # vae_save_iters = 50000
-    # load_model_path = os.path.join(save_path, "vae_model")
-    # load_current_model_path = load_model_path + f"_{args.max_train_iters*args.vae_save_iters}.pt"
-    # _vae_params = load_params(load_current_model_path)
 
     from flax.core import freeze, unfreeze
     def replace_params(training_state, target_params, key_to_replace):
@@ -322,7 +209,7 @@ def train(args: DictConfig):
         return training_state
 
     keys_to_replace = ['encoder', 'precoder']
-    if args.state_dep_prior:
+    if args.state_dependent_prior:
         keys_to_replace.append('prior')
 
     for key_to_replace in keys_to_replace:
@@ -330,7 +217,6 @@ def train(args: DictConfig):
 
     precoder_grad_fn = partial(precoder_loss,
                                emp_model=emp_model,
-                               dynamics_apply=dynamics_model.apply,
                                dynamics_params=_dynamics_params)
     
     precoder_grad_fn = jax.jit(jax.value_and_grad(precoder_grad_fn, has_aux=True))
@@ -364,7 +250,7 @@ def train(args: DictConfig):
         if i_train_iter % args.emp_save_iters == 0 or i_train_iter == args.max_train_iters - 1:
 
             # render trajectories
-            key = eval_model('emp', _emp_params, key, minari_env, args, d_args, precoder_apply, prior_apply) # model in ['vae', 'emp']
+            key = eval_action_generator('emp', _emp_params, key, minari_env, args, d_args, precoder_apply, prior_apply) # model in ['vae', 'emp']
 
             save_current_model_path = save_model_path + f"_{total_updates}.pt"
             print("saving current model at: " + save_current_model_path)

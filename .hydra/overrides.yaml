@@ -1,0 +1,5 @@
+- state_dependent_prior=True
+- learn_dynamics_std=False
+- autonomous=False
+- gamma=0.95
+- n_dynamics_ensembles=5

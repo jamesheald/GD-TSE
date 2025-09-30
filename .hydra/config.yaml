@@ -1,0 +1,55 @@
+env_d4rl_name: D4RL/relocate/expert-v2
+seed: 0
+rtg_scale: 1000
+rtg_target: null
+context_len: 20
+n_blocks: 3
+embed_dim: 128
+n_heads: 1
+dropout_p: 0.0
+gradient_clipping: 0.25
+controlled_variable: obj_pos
+controlled_variables_dim: null
+n_dynamics_ensembles: 5
+h_dims_dynamics:
+- 256
+- 256
+dynamics_dropout_rates:
+- 0.0
+- 0.0
+dynamics_dropout_p: 0.0
+Markov_dynamics: true
+learn_dynamics_std: false
+h_dims_prior:
+- 256
+- 256
+h_dims_encoder:
+- 256
+- 256
+encoder_dropout_rates:
+- 0.0
+- 0.0
+h_dims_GRU: 128
+autonomous: false
+dynamics_batch_size: 4096
+vae_batch_size: 1024
+emp_batch_size: 1024
+grad_updates_per_step: 1
+lr: 1.0e-06
+wt_decay: 0.0001
+warmup_steps: 10000
+gamma: 0.95
+horizon_embed_dim: 128
+n_particles: 1
+num_updates_per_iter: 100
+max_train_iters: 2
+dynamics_save_iters: 2
+vae_save_iters: 2
+emp_save_iters: 2
+max_devices_per_host: null
+state_dependent_prior: true
+trajectory_version: false
+uncertainty_weight: 0.0
+y_decoder_weight: 0.0
+info_gain_weight: 1.0
+n_rollouts: 3

@@ -138,3 +138,5 @@ outputs/**
 model_outputs/**
 slurm-**
 scripts/unused/**
+
+.DS_Store

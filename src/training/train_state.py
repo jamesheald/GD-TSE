@@ -2,8 +2,8 @@ import jax
 from jax import numpy as jnp
 import optax
 
-from decision_transformer.dt.utils import TrainingState, get_local_devices_to_use
-from decision_transformer.pmap import bcast_local_devices
+from src.utils.utils import TrainingState, get_local_devices_to_use
+from src.pmap.pmap import bcast_local_devices
 
 def get_training_state(model, model_kwargs, key, args, ensemble_size):
     
