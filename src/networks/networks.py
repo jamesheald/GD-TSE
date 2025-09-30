@@ -1,5 +1,4 @@
 """
-From https://github.com/nikhilbarhate99/min-decision-transformer/blob/master/decision_transformer/model.py
 Causal transformer (GPT) implementation
 """
 
