@@ -145,7 +145,8 @@ class empowerment(nn.Module):
 
         # sum across time, mean across batch
         mi = discounted_per_horizon_mi.sum(axis=-1).mean()
-        info_gain_loss = (info_gain * mask[:,:,0]).sum(axis=-1).mean()
+        # info_gain_loss = (info_gain * mask[:,:,0]).sum(axis=-1).mean()
+        info_gain_loss = jnp.cumsum(info_gain * mask[:, :, 0], axis=-1).mean()
 
         # cumsum info gain?
         # masking business?
