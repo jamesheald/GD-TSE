@@ -8,6 +8,12 @@ import numpy as np
 
 from typing import Any
 
+def replace_params(training_state, target_params, key_to_replace):
+    params = training_state.params
+    params['params'][key_to_replace] = target_params['params'][key_to_replace]
+    training_state = training_state.replace(params=params)
+    return training_state
+
 def get_controlled_variables(args):
 
     if args.controlled_variable == 'obj_pos':

@@ -12,12 +12,9 @@ from src.pmap.pmap import is_replicated
 
 def create_one_train_iteration(optimizer,
                                grad_fn,
+                               args, 
                                batch_size_per_device,
-                               grad_updates_per_step,
-                               num_updates_per_iter,
-                               max_epi_len,
-                               cumsum_dims,
-                               trans_dim,
+                               d_args,
                                start_time,
                                sample_horizon_len,
                                ensemble):
@@ -26,14 +23,14 @@ def create_one_train_iteration(optimizer,
     def update_step(state: TrainingState, transitions: jnp.ndarray) -> Tuple[TrainingState, bool, Dict[str, jnp.ndarray]]:
         
         transitions = Transition(
-            s_t=transitions[:, :, :cumsum_dims[0]],
-            a_t=transitions[:, :, cumsum_dims[0]:cumsum_dims[1]],
-            s_tp1=transitions[:, :, cumsum_dims[1]:cumsum_dims[2]],
-            rtg_t=transitions[:, :, cumsum_dims[2]:cumsum_dims[3]],
-            ts=transitions[:, :, cumsum_dims[3]:cumsum_dims[4]],
-            mask_t=transitions[:, :, cumsum_dims[4]:cumsum_dims[5]],
-            s_tm1=transitions[:, :, cumsum_dims[5]:cumsum_dims[6]],
-            d_s=transitions[:, :, cumsum_dims[6]:cumsum_dims[7]]
+            s_t=transitions[:, :, :d_args['cumsum_dims'][0]],
+            a_t=transitions[:, :, d_args['cumsum_dims'][0]:d_args['cumsum_dims'][1]],
+            s_tp1=transitions[:, :, d_args['cumsum_dims'][1]:d_args['cumsum_dims'][2]],
+            rtg_t=transitions[:, :, d_args['cumsum_dims'][2]:d_args['cumsum_dims'][3]],
+            ts=transitions[:, :, d_args['cumsum_dims'][3]:d_args['cumsum_dims'][4]],
+            mask_t=transitions[:, :, d_args['cumsum_dims'][4]:d_args['cumsum_dims'][5]],
+            s_tm1=transitions[:, :, d_args['cumsum_dims'][5]:d_args['cumsum_dims'][6]],
+            d_s=transitions[:, :, d_args['cumsum_dims'][6]:d_args['cumsum_dims'][7]]
         )
 
         key, subkey = jax.random.split(state.key, 2)
@@ -55,22 +52,22 @@ def create_one_train_iteration(optimizer,
     def sample_data(training_state, replay_buffer, max_epi_len):
         key1, key2, key3 = jax.random.split(training_state.key, 3)
         epi_idx = jax.random.randint(
-            key1, (int(batch_size_per_device * grad_updates_per_step),),
+            key1, (int(batch_size_per_device * args.grad_updates_per_step),),
             minval=0,
             maxval=replay_buffer.data.shape[0])  # from (0, num_epi)
         context_idx = jax.random.randint(
-            key2, (int(batch_size_per_device * grad_updates_per_step),),
+            key2, (int(batch_size_per_device * args.grad_updates_per_step),),
             minval=0,
             maxval=max_epi_len)
 
         def dynamic_slice_context(carry, x):
             traj, c_idx = x
-            return (), jax.lax.dynamic_slice(traj, (c_idx, 0), (sample_horizon_len, trans_dim))
+            return (), jax.lax.dynamic_slice(traj, (c_idx, 0), (sample_horizon_len, d_args['trans_dim']))
 
         transitions = jnp.take(replay_buffer.data, epi_idx, axis=0, mode='clip')
         _, transitions = jax.lax.scan(dynamic_slice_context, (), (transitions, context_idx))
         transitions = jnp.reshape(transitions,
-                                [grad_updates_per_step, -1] + list(transitions.shape[1:]))
+                                [args.grad_updates_per_step, -1] + list(transitions.shape[1:]))
 
         training_state = training_state.replace(key=key3)
         return training_state, transitions
@@ -89,7 +86,7 @@ def create_one_train_iteration(optimizer,
 
         one_epoch = lambda state, buffer: jax.lax.scan(
             partial(run_one_epoch, max_epi_len=max_epi_len),
-            (state, buffer), None, length=num_updates_per_iter)
+            (state, buffer), None, length=args.num_updates_per_iter)
 
         if ensemble:
             # vmap in case of ensemble of models
@@ -100,7 +97,7 @@ def create_one_train_iteration(optimizer,
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
         return training_state, replay_buffer, metrics, synchro
 
-    run_training = jax.pmap(partial(run_training, max_epi_len=max_epi_len), axis_name='i')
+    run_training = jax.pmap(partial(run_training, max_epi_len=d_args['max_epi_len']), axis_name='i')
 
     def one_train_iteration(training_state: TrainingState,
                             replay_buffer: ReplayBuffer,
@@ -118,7 +115,7 @@ def create_one_train_iteration(optimizer,
 
         time_elapsed = str(datetime.now().replace(microsecond=0) - start_time)
 
-        total_updates += num_updates_per_iter
+        total_updates += args.num_updates_per_iter
 
         # build log string automatically
         log_str = "=" * 60 + "\n"

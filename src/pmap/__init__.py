@@ -1,1 +1,1 @@
-from .pmap import synchronize_hosts
+from .pmap import synchronize_hosts, bcast_local_devices

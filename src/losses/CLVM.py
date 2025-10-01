@@ -67,8 +67,10 @@ def CLVM_loss(vae_params: Any,
                                                    vae_key,
                                                    rngs={'dropout': dropout_key})
     
-    CLVM_loss = kl_loss + action_decoder_loss
+    loss = kl_loss + action_decoder_loss
 
-    return CLVM_loss, {'CLVM_loss': CLVM_loss,
-                       'KL_loss': kl_loss,
-                       'action_decoder_loss': action_decoder_loss}
+    return loss, {'CLVM_loss': loss,
+                  'KL_loss': kl_loss,
+                  'action_decoder_loss': action_decoder_loss}
+
+CLVM_grad = jax.value_and_grad(CLVM_loss, has_aux=True)

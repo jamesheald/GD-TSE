@@ -1,3 +1,3 @@
-from .dynamics import dynamics_loss
-from .CLVM import CLVM_loss
-from .precoder import precoder_loss
+from .dynamics import dynamics_grad
+from .CLVM import CLVM_grad
+from .precoder import precoder_grad

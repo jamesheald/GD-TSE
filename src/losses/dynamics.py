@@ -1,4 +1,5 @@
 from typing import Any
+import jax
 from jax import numpy as jnp
 import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
@@ -84,3 +85,5 @@ def dynamics_loss(dynamics_params: Any,
     loss /= d_s.shape[-1] 
 
     return loss, {'dynamics_loss': loss}
+
+dynamics_grad = jax.value_and_grad(dynamics_loss, has_aux=True)

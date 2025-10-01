@@ -52,14 +52,16 @@ def precoder_loss(emp_params: Any,
     s_tm1_s_t = jnp.concatenate([s_tm1, s_t], axis=-1)
 
     mi, info_gain_loss = emp_model.apply(emp_params,
-                                                           s_tm1_s_t,
-                                                           mask,
-                                                           dynamics_params,
-                                                           emp_key,
-                                                           rngs={'dropout': dropout_key})
+                                         s_tm1_s_t,
+                                         mask,
+                                         dynamics_params,
+                                         emp_key,
+                                         rngs={'dropout': dropout_key})
 
-    precoder_loss = info_gain_loss - mi
+    loss = info_gain_loss - mi
 
-    return precoder_loss, {'precoder_loss': precoder_loss,
-                           'mi': mi,
-                           'info_gain_loss': info_gain_loss}
+    return loss, {'precoder_loss': loss,
+                  'mi': mi,
+                  'info_gain_loss': info_gain_loss}
+
+precoder_grad = jax.value_and_grad(precoder_loss, has_aux=True)

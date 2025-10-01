@@ -180,8 +180,8 @@ class CLVM(nn.Module):
 
         actions = self.precoder(s_t, z_samp)
 
-        mask = jnp.arange(self.args.context_len)[None] <= H_step[:,None] # shape (N,)
-        a_mse = 0.5 * ((actions - a_t)**2 * mask[:,:,None]).sum(axis=-1).reshape(-1)
+        mask = jnp.arange(self.args.context_len)[None] <= H_step[:,None]
+        a_sse = 0.5 * ((actions - a_t)**2 * mask[:,:,None]).sum(axis=-1).reshape(-1)
 
         ###################### loss ###################### 
 
@@ -201,9 +201,9 @@ class CLVM(nn.Module):
         valid_mask = (mask.reshape(-1, 1) > 0).squeeze(-1)
 
         # mean across batch, sum across time
-        a_decoder_loss = jnp.sum(a_mse * valid_mask) / a_shape[0]
+        a_decoder_loss = jnp.sum(a_sse * valid_mask) / a_shape[0]
 
-        # normalize
+        # scale loss terms
         kl_loss /= self.d_args['act_dim']
         a_decoder_loss /= self.d_args['act_dim']
 

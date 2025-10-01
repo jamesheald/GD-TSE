@@ -139,22 +139,26 @@ class empowerment(nn.Module):
 
         per_horizon_mi = log_prob_z + source_dist.entropy()[:,None] # B X T
 
-        # discount and mask time/horizon
+        # gamma discounting
         gamma_geom = self.args.gamma ** jnp.arange(self.args.context_len)
+
+        # gamma discounted mutual information
         discounted_per_horizon_mi = gamma_geom[None] * per_horizon_mi * mask[:,:,0]
 
-        # sum across time, mean across batch
+        # sum mi across time, mean across batch
         mi = discounted_per_horizon_mi.sum(axis=-1).mean()
-        # info_gain_loss = (info_gain * mask[:,:,0]).sum(axis=-1).mean()
-        info_gain_loss = jnp.cumsum(info_gain * mask[:, :, 0], axis=-1).mean()
 
-        # cumsum info gain?
-        # masking business?
+        # cumulative info gain across time, mean across batch
+        cum_info_gain = jnp.cumsum(info_gain * mask[:, :, 0], axis=-1)
+
+        # gamma discounted cumulative info gain
+        discounted_info_gain = gamma_geom[None] * cum_info_gain
+
+        # mean across batch
+        info_gain_loss = discounted_info_gain.mean()
 
         # scale loss terms
-        mi /= self.args.context_len
-        mi /= z_samp.shape[-1]
-        info_gain_loss /= self.args.context_len
-        info_gain_loss /= z_samp.shape[-1]
+        mi /= (self.args.context_len * z_samp.shape[-1])
+        info_gain_loss /= (self.args.context_len * z_samp.shape[-1])
         
         return mi, info_gain_loss
