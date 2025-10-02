@@ -52,7 +52,7 @@ def CLVM_loss(vae_params: Any,
     
     horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
     
-    y_t = transitions.s_tp1[...,controlled_variables]  # (batch_size_per_device, context_len, controlled_variables_dim)
+    y_t = transitions.s_tp1[..., controlled_variables]  # (batch_size_per_device, context_len, controlled_variables_dim)
 
     vae_key, dropout_key = jax.random.split(key, 2)
 

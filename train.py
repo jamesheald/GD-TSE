@@ -73,10 +73,7 @@ def train(args: DictConfig):
 
         training_state, dynamics_optimizer = get_training_state(dynamics_model, model_kwargs, subkey, args, args.n_dynamics_ensembles)
 
-        dynamics_grad_fn = partial(dynamics_grad,
-                                   dynamics_model=dynamics_model,
-                                   delta_obs_min=d_args['delta_obs_min'],
-                                   delta_obs_max=d_args['delta_obs_max'])
+        dynamics_grad_fn = partial(dynamics_grad, dynamics_model, d_args)
 
         one_train_iteration = create_one_train_iteration(dynamics_optimizer,
                                                          dynamics_grad_fn,
@@ -122,10 +119,7 @@ def train(args: DictConfig):
     else:
         prior_apply = None
             
-    precoder_apply = GRU_Precoder(act_dim=d_args['act_dim'],
-                                  context_len=args.context_len,
-                                  hidden_size=args.h_dims_GRU,
-                                  autonomous=args.autonomous).apply
+    precoder_apply = GRU_Precoder(args, d_args).apply
 
     if args.load_CVLM_path is not None:
 
@@ -153,9 +147,7 @@ def train(args: DictConfig):
         save_model_path = os.path.join(save_path, "vae_model")
         os.makedirs(save_model_path, exist_ok=True)
 
-        CLVM_grad_fn = partial(CLVM_grad,
-                               vae_model=vae_model,
-                               controlled_variables=controlled_variables)
+        CLVM_grad_fn = partial(CLVM_grad, vae_model, controlled_variables)
 
         one_train_iteration = create_one_train_iteration(vae_optimizer,
                                                          CLVM_grad_fn,
@@ -205,7 +197,7 @@ def train(args: DictConfig):
 
     emp_training_state, emp_optimizer = get_training_state(emp_model, model_kwargs, subkey, args, ensemble_size=1)
 
-    keys_to_replace = ['encoder', 'precoder']
+    keys_to_replace = ['precoder', 'q_posterior']
     if args.state_dependent_prior:
         keys_to_replace.append('prior')
 
@@ -213,9 +205,7 @@ def train(args: DictConfig):
     for key_to_replace in keys_to_replace:
         emp_training_state = replace_params(emp_training_state, vae_params, key_to_replace)
 
-    precoder_grad_fn = partial(precoder_grad,
-                            emp_model=emp_model,
-                            dynamics_params=_dynamics_params)
+    precoder_grad_fn = partial(precoder_grad, emp_model, _dynamics_params)
 
     one_train_iteration = create_one_train_iteration(emp_optimizer,
                                                      precoder_grad_fn,

@@ -9,8 +9,8 @@ hydra:
 
 base_save_path: /nfs/nhome/live/jheald/jax_dt/model_outputs
 
-load_dynamics_path: ${base_save_path}/2025-09-30/k1p03qj2/dynamics_model_100000.pt
-load_CVLM_path: ${base_save_path}/2025-09-30/k1p03qj2/vae_model_100000.pt
+load_dynamics_path: null # ${base_save_path}/2025-09-30/k1p03qj2/dynamics_model_100000.pt
+load_CVLM_path: null # ${base_save_path}/2025-10-01/7d8rp9k1/vae_model_100000.pt
 
 env_d4rl_name: D4RL/relocate/expert-v2
 
@@ -23,6 +23,7 @@ gamma: 0.95
 
 controlled_variable: obj_pos
 controlled_variables_dim: null
+controlled_variables_idx: null
 
 n_dynamics_ensembles: 5
 h_dims_dynamics: [256, 256]
@@ -32,9 +33,9 @@ learn_dynamics_std: False
 state_dependent_prior: False
 h_dims_prior: [256, 256]
 
-h_dims_encoder: [256, 256]
 horizon_embed_dim: 128
-encoder_dropout_rates: [0., 0.]
+h_dims_posterior: [256, 256]
+posterior_dropout_rates: [0., 0.]
 
 h_dims_GRU: 128
 autonomous: False
@@ -53,7 +54,7 @@ num_updates_per_iter: 100
 max_train_iters: 1_000
 dynamics_save_iters: 1_000
 vae_save_iters: 1_000
-emp_save_iters: 50
+emp_save_iters: 1_000
 
 max_devices_per_host: null
 

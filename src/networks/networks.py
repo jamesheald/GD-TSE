@@ -499,10 +499,8 @@ class sinusoidal_pos_emb(nn.Module):
         return emb
 
 class GRU_Precoder(nn.Module):
-    hidden_size: int
-    act_dim: int
-    context_len: int
-    autonomous: bool = False
+    args: Any
+    d_args: Any
 
     @nn.compact
     def __call__(self, s_t: jnp.ndarray, z_t: jnp.ndarray) -> jnp.ndarray:
@@ -514,28 +512,23 @@ class GRU_Precoder(nn.Module):
             # Initial input: (batch, state_dim + z_dim)
             initial_input = jnp.concatenate([s_t[0, :], z_t], axis=-1)
 
-            # Map to initial hidden state
-            # initial_carry = nn.Dense(self.hidden_size)(initial_input)
-
-            initial_carry = MLP(out_dim=self.hidden_size,
+            initial_carry = MLP(out_dim=self.args.h_dims_GRU,
                                 h_dims=[256,256],
                                 drop_out_rates=[0., 0.])(initial_input)
 
-            gru_cell = nn.GRUCell(features=self.hidden_size)
+            gru_cell = nn.GRUCell(features=self.args.h_dims_GRU)
 
             # Wrap the GRUCell with nn.RNN
-            # cell_size is typically the hidden state size of the cell
             rnn_layer = nn.RNN(gru_cell)
 
             # Apply the RNN layer to the inputs
-            if self.autonomous:
-                inputs = jnp.zeros((self.context_len,1))
+            if self.args.autonomous:
+                inputs = jnp.zeros((self.args.context_len,1))
             else:
-                inputs = initial_input[None].repeat(self.context_len, axis=0)
+                inputs = initial_input[None].repeat(self.args.context_len, axis=0)
             _, outputs = rnn_layer(inputs, initial_carry=initial_carry, return_carry=True)
 
-            ys = nn.Dense(self.act_dim)(outputs)
-            # ys = nn.Dense(self.act_dim)(jnp.concatenate((initial_input[None,:].repeat(outputs.shape[0], axis=0), outputs), axis=-1))
+            ys = nn.Dense(self.d_args['act_dim'])(outputs)
             actions = jnp.tanh(ys)
                 
             return actions  # (T, act_dim)
@@ -620,3 +613,32 @@ class dynamics(nn.Module):
             return jnp.concatenate([x, log_std], axis=-1)
 
         return x
+
+class posterior(nn.Module):
+    args: Any
+    d_args: Any
+
+    def setup(self):
+
+
+        self.horizon_mlp = nn.Sequential([sinusoidal_pos_emb(self.args.horizon_embed_dim),
+                                          nn.Dense(self.args.horizon_embed_dim * 4),
+                                          mish(),
+                                          nn.Dense(self.args.horizon_embed_dim)])
+
+        self.posterior_mlp = MLP(out_dim=self.args.controlled_variables_dim*2,
+                           h_dims=self.args.h_dims_posterior,
+                           drop_out_rates=self.args.posterior_dropout_rates)
+
+    def __call__(self, state, horizon_steps, future_y, key):
+
+        if horizon_steps.shape[0] != state.shape[0]:
+            # mi training
+            horizon_embedding = self.horizon_mlp(horizon_steps)[None].repeat(state.shape[0],axis=0)
+        else:
+            # CVLM training
+            horizon_embedding = self.horizon_mlp(horizon_steps)
+
+        z_dist_params = self.posterior_mlp(jnp.concatenate([state, future_y, horizon_embedding], axis=-1), key)
+
+        return z_dist_params

@@ -13,11 +13,16 @@ def get_dataset(args):
     learned_minari_env = minari_dataset.recover_environment(render_mode='rgb_array')
 
     # make hand and ball position relative to initial position of hand
+    # 30:33: palm_pos - obj_pos
+    # 33:36: palm_pos - target_pos
+    # 36:39: obj_pos - target_pos
     target_agnostic_minari_dataset = [replace(episode,
                                                 observations=episode.observations - np.concatenate((np.zeros(33),
                                                                                                     episode.observations[0,33:36],
                                                                                                     episode.observations[0,33:36]))[None])
                                                 for episode in minari_dataset]
+    # 33:36: palm_pos - target_pos - (palm_pos_0 - target_pos) = palm_pos - palm_pos_0
+    # 36:39: obj_pos - target_pos - (palm_pos_0 - target_pos) = obj_pos - palm_pos_0
     
     # extract obs and episode length range
     max_epi_len = -1
@@ -45,12 +50,10 @@ def get_dataset(args):
     delta_obs_stats = [ob[1:]-ob[:-1] for ob in obs_stats]
     delta_obs_stats = jnp.concatenate(delta_obs_stats, axis=0)
     delta_obs_mean, delta_obs_std = jnp.mean(delta_obs_stats, axis=0), jnp.std(delta_obs_stats, axis=0) + 1e-8
+    
     delta_obs_min, delta_obs_max = jnp.min(delta_obs_stats, axis=0), jnp.max(delta_obs_stats, axis=0)
     delta_obs_min = standardise_data(delta_obs_min, delta_obs_mean, delta_obs_std)
     delta_obs_max = standardise_data(delta_obs_max, delta_obs_mean, delta_obs_std)
-
-    delta_obs_scale = delta_obs_std / obs_std
-    delta_obs_shift = delta_obs_mean / obs_std
 
     replay_buffer_data = []
     for episode in target_agnostic_minari_dataset:
@@ -121,10 +124,10 @@ def get_dataset(args):
                 "cumsum_dims": cumsum_dims,
                 "obs_mean": obs_mean,
                 "obs_std": obs_std,
+                "delta_obs_mean": delta_obs_mean,
+                "delta_obs_std": delta_obs_std,
                 "delta_obs_min": delta_obs_min,
                 "delta_obs_max": delta_obs_max,
-                "delta_obs_scale": delta_obs_scale,
-                "delta_obs_shift": delta_obs_shift,
                 "max_epi_len": max_epi_len
                 }
 

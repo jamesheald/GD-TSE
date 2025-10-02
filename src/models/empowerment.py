@@ -10,7 +10,7 @@ tfb = tfp.bijectors
 
 from jax.lax import stop_gradient
 
-from src.networks import GRU_Precoder, MLP, sinusoidal_pos_emb, mish
+from src.networks import GRU_Precoder, MLP, posterior
 from src.rollout import get_rollout_function
 
 class empowerment(nn.Module):
@@ -26,7 +26,7 @@ class empowerment(nn.Module):
 
     Methods:
         setup():
-            Initializes encoder, precoder, optional state-dependent prior, horizon MLP, 
+            Initializes posterior, precoder, optional state-dependent prior, horizon MLP, 
             and batched rollout function.
 
         __call__(s_t, mask, dynamics_params, key):
@@ -49,36 +49,20 @@ class empowerment(nn.Module):
 
     def setup(self):
 
-        self.horizon_mlp = nn.Sequential([sinusoidal_pos_emb(self.args.horizon_embed_dim),
-                                          nn.Dense(self.args.horizon_embed_dim * 4),
-                                          mish(),
-                                          nn.Dense(self.args.horizon_embed_dim)])
-
         if self.args.state_dependent_prior:
             self.prior = MLP(out_dim=self.args.controlled_variables_dim*2,
                              h_dims=self.args.h_dims_prior,
                              drop_out_rates=[0.,0.])
         
-        self.precoder = GRU_Precoder(act_dim=self.d_args['act_dim'],
-                                     context_len=self.args.context_len,
-                                     hidden_size=self.args.h_dims_GRU,
-                                     autonomous=self.args.autonomous)
+        self.precoder = GRU_Precoder(self.args, self.d_args)
 
-        self.encoder = MLP(out_dim=self.args.controlled_variables_dim*2,
-                    h_dims=self.args.h_dims_encoder,
-                    drop_out_rates=self.args.encoder_dropout_rates)
+        self.q_posterior = posterior(self.args, self.d_args)
             
-        self.batch_peform_rollout = get_rollout_function(self.dynamics_apply,
-                                                        self.args.n_dynamics_ensembles,
-                                                        self.d_args['obs_dim'],
-                                                        self.d_args['delta_obs_min'],
-                                                        self.d_args['delta_obs_max'],
-                                                        self.d_args['delta_obs_scale'],
-                                                        self.d_args['delta_obs_shift'])
+        self.batch_peform_rollout = get_rollout_function(self.dynamics_apply, self.args, self.d_args)
 
     def __call__(self, s_t, mask, dynamics_params, key):
 
-        sample_z_key, encoder_key = jax.random.split(key)
+        sample_z_key, posterior_key = jax.random.split(key)
 
         ###################### state-dependent prior ###################### 
 
@@ -103,9 +87,9 @@ class empowerment(nn.Module):
 
         actions = self.precoder(s_t, z_samp)
 
-        ###################### Markov dynamics ###################### 
+        ###################### simulate dynamics ###################### 
 
-        def sample_one_traj(s_t, actions, key, dynamics_params):        
+        def sample_trajectory_from_dynamics_model(s_t, actions, key, dynamics_params):        
 
             dynamics_keys = jax.random.split(key, actions.shape[0])
             next_state, info_gain = self.batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions, dynamics_params)
@@ -114,11 +98,11 @@ class empowerment(nn.Module):
 
             return y_samp, info_gain
 
-        y_samp, info_gain = sample_one_traj(s_t, actions, key, dynamics_params)
+        y_samp, info_gain = sample_trajectory_from_dynamics_model(s_t, actions, key, dynamics_params)
 
-        horizon_embedding = self.horizon_mlp(jnp.arange(1,self.args.context_len+1))[None].repeat(s_t.shape[0],axis=0)
+        horizon_steps = jnp.arange(1,self.args.context_len + 1)
         s_t_expand = s_t[:,:1,:].repeat(self.args.context_len, axis=1)
-        z_dist_params = self.encoder(jnp.concatenate([s_t_expand, y_samp, horizon_embedding], axis=-1), encoder_key)
+        z_dist_params = self.q_posterior(s_t_expand, horizon_steps, y_samp, posterior_key)
 
         # posterior variance should be less than prior variance
         z_mean, z_log_std = jnp.split(z_dist_params, 2, axis=-1)

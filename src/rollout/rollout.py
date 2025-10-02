@@ -13,25 +13,14 @@ from matplotlib import pyplot as plt
 
 from src.utils.utils import get_mean_and_log_std, standardise_data, unstandardise_data
 
-def get_rollout_function(dynamics_apply,
-                         n_dynamics_ensembles,
-                         obs_dim,
-                         delta_obs_min,
-                         delta_obs_max,
-                         delta_obs_scale,
-                         delta_obs_shift,
-                         eps=1e-3):
+def get_rollout_function(dynamics_apply, args, d_args, eps=1e-3):
     """
     Create a batched rollout function using an ensemble of dynamics models.
 
     Args:
         dynamics_apply (Callable): Function to compute dynamics predictions for a single ensemble member.
-        n_dynamics_ensembles (int): Number of ensemble dynamics models.
-        obs_dim (int): Dimensionality of the observation/state vector.
-        delta_obs_min (float): Minimum bound for delta observation (used in bijector).
-        delta_obs_max (float): Maximum bound for delta observation (used in bijector).
-        delta_obs_scale (float): Scaling factor applied to delta observation.
-        delta_obs_shift (float): Shift added to delta observation after scaling.
+        args (Any): Configuration object with hyperparameters.
+        d_args (Any): Environment-specific arguments (e.g., obs dimension).
         eps (float, optional): Small epsilon to prevent numerical issues. Defaults to 1e-3.
 
     Returns:
@@ -48,7 +37,7 @@ def get_rollout_function(dynamics_apply,
             key, dropout_key, sample_i_key, sample_s_key = jax.random.split(key, 4)
             
             # predict the delta observation
-            dropout_keys = jax.random.split(dropout_key, n_dynamics_ensembles)
+            dropout_keys = jax.random.split(dropout_key, args.n_dynamics_ensembles)
             s_dist_params = jax.vmap(dynamics_apply, in_axes=(0,None,None,0))(dynamics_params, state, action, dropout_keys)
             s_mean, s_log_std = get_mean_and_log_std(s_dist_params)
 
@@ -59,19 +48,20 @@ def get_rollout_function(dynamics_apply,
             info_gain = jnp.log(1 + ratio).mean(axis=-1)
 
             # sample a delta observation from the ensemble
-            idx = jax.random.categorical(sample_i_key, jnp.ones(n_dynamics_ensembles), axis=-1)
+            idx = jax.random.categorical(sample_i_key, jnp.ones(args.n_dynamics_ensembles), axis=-1)
             bounded_bijector = tfb.Chain([
-                tfb.Shift(shift=(delta_obs_min - eps/2)),
-                tfb.Scale(scale=(delta_obs_max - delta_obs_min + eps)),
+                tfb.Shift(shift=(d_args['delta_obs_min'] - eps/2)),
+                tfb.Scale(scale=(d_args['delta_obs_max'] - d_args['delta_obs_min'] + eps)),
                 tfb.Sigmoid(),
             ])
             s_base_dist = tfd.MultivariateNormalDiag(loc=s_mean[idx], scale_diag=jnp.exp(s_log_std[idx]))
             s_dist = tfd.TransformedDistribution(distribution=s_base_dist, bijector=bounded_bijector)
             delta_s = s_dist.sample(seed=sample_s_key)
-
+            
             # calculate the next observation by adding the delta observation to the current observation
-            delta_s = delta_s * delta_obs_scale + delta_obs_shift
-            s_curr = state[..., obs_dim:]
+            delta_s = unstandardise_data(delta_s, d_args['delta_obs_mean'], d_args['delta_obs_std'])
+            delta_s = standardise_data(delta_s, d_args['obs_mean'], d_args['obs_std'])
+            s_curr = state[..., d_args['obs_dim']:]
             s_next = s_curr + delta_s
 
             # concatenate the current observation with the next observation to define the state
@@ -112,10 +102,10 @@ def sample_actions(obs, key, precoder_params, args, d_args, prior_params, precod
         dist_z_prior = tfd.MultivariateNormalDiag(loc=jnp.zeros((1, args.controlled_variables_dim)),
                                                   scale_diag=jnp.ones((1, args.controlled_variables_dim)))
         
-    # sample from prior
+    # sample latent action from prior
     z_samp = dist_z_prior.sample(seed=key)
     
-    # precoder latent action via precoder
+    # precoder latent action
     actions = jax.jit(precoder_apply)(precoder_params, target_agnostic_obs[None,None, :], z_samp)
 
     return actions[0,:,:]
@@ -130,7 +120,7 @@ def eval_action_generator(model, params, key, minari_env, args, d_args, precoder
         prior_params = {'params': params['params']['prior']}
     else:
         prior_params = None
-    encoder_params = {'params': params['params']['encoder']}
+    q_posterior_params = {'params': params['params']['q_posterior']}
     precoder_params = {'params': params['params']['precoder']}
 
     n_rollouts = args.n_rollouts
@@ -163,25 +153,19 @@ def eval_dynamics_model(args, d_args, key, dynamics_apply, dynamics_params, mina
 
     if params is None:
         prior_params = None
-        encoder_params = None
+        q_posterior_params = None
         precoder_params = None
     else:
         if args.state_dependent_prior:
             prior_params = {'params': params['params']['prior']}
         else:
             prior_params = None
-        encoder_params = {'params': params['params']['encoder']}
+        q_posterior_params = {'params': params['params']['q_posterior']}
         precoder_params = {'params': params['params']['precoder']}
 
     def get_predicted_obs(obs, key, actions, dynamics_params):
 
-        batch_peform_rollout = get_rollout_function(dynamics_apply,
-                                                        args.n_dynamics_ensembles,
-                                                        d_args['obs_dim'],
-                                                        d_args['delta_obs_min'],
-                                                        d_args['delta_obs_max'],
-                                                        d_args['delta_obs_scale'],
-                                                        d_args['delta_obs_shift'])
+        batch_peform_rollout = get_rollout_function(dynamics_apply, args, d_args)
 
         target_agnostic_obs = obs - np.concatenate((np.zeros(33),
                                         obs[33:36],

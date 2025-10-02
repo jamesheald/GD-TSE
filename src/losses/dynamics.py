@@ -11,8 +11,7 @@ def dynamics_loss(dynamics_params: Any,
                   transitions: Transition,
                   key: jnp.ndarray,
                   dynamics_model: Any,
-                  delta_obs_min: jnp.ndarray,
-                  delta_obs_max: jnp.ndarray,
+                  d_args: Any,
                   min_log_std: float = -20.,
                   max_log_std: float = 2. ,
                   eps: float = 1e-3) -> jnp.ndarray:
@@ -34,10 +33,8 @@ def dynamics_loss(dynamics_params: Any,
         JAX PRNG key for stochastic sampling.
     dynamics_model : Any
         Flax/JAX dynamics model with an `apply` method.
-    delta_obs_min : jnp.ndarray
-        Minimum bound for delta observations.
-    delta_obs_max : jnp.ndarray
-        Maximum bound for delta observations.
+    d_args (Any):
+        Environment-specific arguments (e.g., delta_obs_min, delta_obs_max).
     min_log_std : float, optional
         Minimum log standard deviation, by default -20.
     max_log_std : float, optional
@@ -73,8 +70,8 @@ def dynamics_loss(dynamics_params: Any,
                                            scale_diag=jnp.exp(s_log_std))
 
     bounded_bijector = tfb.Chain([
-        tfb.Shift(shift=(delta_obs_min - eps/2)),
-        tfb.Scale(scale=(delta_obs_max - delta_obs_min + eps)),
+        tfb.Shift(shift=(d_args['delta_obs_min'] - eps/2)),
+        tfb.Scale(scale=(d_args['delta_obs_max'] - d_args['delta_obs_min'] + eps)),
         tfb.Sigmoid(),
     ])
     dist = tfd.TransformedDistribution(distribution=base_dist,
