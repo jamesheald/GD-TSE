@@ -23,6 +23,7 @@ from src.data import get_dataset
 from src.rollout import eval_dynamics_model, eval_action_generator
 from src.pmap import synchronize_hosts, bcast_local_devices
 from src.utils import get_local_devices_to_use, get_controlled_variables, save_params, load_params, replace_params
+from control import control
 
 cfg_path = os.path.dirname(__file__)
 cfg_path = os.path.join(cfg_path, 'conf')
@@ -38,7 +39,7 @@ def train(args: DictConfig):
     wandb_run = wandb.init(
         name=f'{args.env_d4rl_name}-{random.randint(int(1e5), int(1e6) - 1)}',
         group=args.env_d4rl_name,
-        project='GD-TSE',
+        project='GD-TSE-train',
         config=dict(args)
     )
 
@@ -49,7 +50,7 @@ def train(args: DictConfig):
     os.makedirs(save_model_path, exist_ok=True)
 
     local_devices_to_use = get_local_devices_to_use(args)
-    controlled_variables, args = get_controlled_variables(args)
+    args = get_controlled_variables(args)
     replay_buffer, minari_dataset, minari_env, learned_minari_env, d_args = get_dataset(args)
 
     ###################################### dynamics training ###################################### 
@@ -73,7 +74,7 @@ def train(args: DictConfig):
 
         training_state, dynamics_optimizer = get_training_state(dynamics_model, model_kwargs, subkey, args, args.n_dynamics_ensembles)
 
-        dynamics_grad_fn = partial(dynamics_grad, dynamics_model, d_args)
+        dynamics_grad_fn = partial(dynamics_grad, dynamics_model=dynamics_model, d_args=d_args)
 
         one_train_iteration = create_one_train_iteration(dynamics_optimizer,
                                                          dynamics_grad_fn,
@@ -101,7 +102,6 @@ def train(args: DictConfig):
                 key = eval_dynamics_model(args, d_args, key, dynamics_model.apply, _dynamics_params, minari_dataset, minari_env, learned_minari_env)
 
                 save_current_model_path = save_model_path + f"_{total_updates}.pt"
-                print("saving current model at: " + save_current_model_path)
                 save_params(save_current_model_path, _dynamics_params)
 
         synchronize_hosts()
@@ -110,7 +110,7 @@ def train(args: DictConfig):
 
     ###################################### CLVM training ###################################### 
 
-    vae_model = CLVM(args, d_args, controlled_variables)
+    vae_model = CLVM(args, d_args)
 
     if args.state_dependent_prior:
         prior_apply = MLP(out_dim=args.controlled_variables_dim*2,
@@ -147,7 +147,7 @@ def train(args: DictConfig):
         save_model_path = os.path.join(save_path, "vae_model")
         os.makedirs(save_model_path, exist_ok=True)
 
-        CLVM_grad_fn = partial(CLVM_grad, vae_model, controlled_variables)
+        CLVM_grad_fn = partial(CLVM_grad, vae_model=vae_model, args=args)
 
         one_train_iteration = create_one_train_iteration(vae_optimizer,
                                                          CLVM_grad_fn,
@@ -176,7 +176,6 @@ def train(args: DictConfig):
                 key = eval_dynamics_model(args, d_args, key, dynamics_model.apply, _dynamics_params, minari_dataset, minari_env, learned_minari_env, _vae_params, precoder_apply, prior_apply)
 
                 save_current_model_path = save_model_path + f"_{total_updates}.pt"
-                print("saving current model at: " + save_current_model_path)
                 save_params(save_current_model_path, _vae_params)
 
         synchronize_hosts()
@@ -185,7 +184,7 @@ def train(args: DictConfig):
 
     ###################################### mutual information training ###################################### 
 
-    emp_model = empowerment(args, d_args, controlled_variables, dynamics_model.apply)
+    emp_model = empowerment(args, d_args, dynamics_model.apply)
 
     subkey, key = jax.random.split(key)
     dummy_states = jnp.zeros((1, args.context_len, d_args['obs_dim']*2))
@@ -205,7 +204,7 @@ def train(args: DictConfig):
     for key_to_replace in keys_to_replace:
         emp_training_state = replace_params(emp_training_state, vae_params, key_to_replace)
 
-    precoder_grad_fn = partial(precoder_grad, emp_model, _dynamics_params)
+    precoder_grad_fn = partial(precoder_grad, emp_model=emp_model, dynamics_params=_dynamics_params)
 
     one_train_iteration = create_one_train_iteration(emp_optimizer,
                                                      precoder_grad_fn,
@@ -236,12 +235,17 @@ def train(args: DictConfig):
             key = eval_action_generator('emp', _emp_params, key, minari_env, args, d_args, precoder_apply, prior_apply) # model in ['vae', 'emp']
 
             save_current_model_path = save_model_path + f"_{total_updates}.pt"
-            print("saving current model at: " + save_current_model_path)
             save_params(save_current_model_path, _emp_params)
 
     synchronize_hosts()
     
     print("finished mutual information training!")
+
+    ###################################### evaluate control ###################################### 
+
+    # use the last saved (most trained) model to evaluate control
+    args.load_control_path = save_current_model_path
+    control(args)
 
 if __name__ == '__main__':
     train()

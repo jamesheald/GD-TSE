@@ -20,7 +20,6 @@ class CLVM(nn.Module):
     Attributes:
         args (Any): Configuration object with hyperparameters.
         d_args (Any): Environment-specific arguments (e.g., action dimension).
-        controlled_variables (List[int]): Indices of controlled variables.
 
     Methods:
         setup():
@@ -43,7 +42,6 @@ class CLVM(nn.Module):
     """
     args: Any
     d_args: Any
-    controlled_variables: List
 
     def setup(self):
 

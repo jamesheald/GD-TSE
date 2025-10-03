@@ -60,9 +60,8 @@ def get_rollout_function(dynamics_apply, args, d_args, eps=1e-3):
             
             # calculate the next observation by adding the delta observation to the current observation
             delta_s = unstandardise_data(delta_s, d_args['delta_obs_mean'], d_args['delta_obs_std'])
-            delta_s = standardise_data(delta_s, d_args['obs_mean'], d_args['obs_std'])
             s_curr = state[..., d_args['obs_dim']:]
-            s_next = s_curr + delta_s
+            s_next = s_curr + delta_s / d_args['obs_std']
 
             # concatenate the current observation with the next observation to define the state
             next_state = jnp.concatenate([s_curr, s_next], axis=-1)

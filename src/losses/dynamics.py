@@ -5,15 +5,13 @@ import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
 tfb = tfp.bijectors
 
-from src.utils.utils import Transition
+from src.utils.utils import Transition, get_mean_and_log_std
 
 def dynamics_loss(dynamics_params: Any,
                   transitions: Transition,
                   key: jnp.ndarray,
                   dynamics_model: Any,
                   d_args: Any,
-                  min_log_std: float = -20.,
-                  max_log_std: float = 2. ,
                   eps: float = 1e-3) -> jnp.ndarray:
     """
     Compute the negative log-likelihood loss of the dynamics model using a 
@@ -62,23 +60,24 @@ def dynamics_loss(dynamics_params: Any,
                                s_tm1_s_t,
                                a_t,
                                key)
-    
-    s_mean, s_log_std = jnp.split(s_p, 2, axis=-1)
-    s_log_std = jnp.clip(s_log_std, min_log_std, max_log_std)
 
-    base_dist = tfd.MultivariateNormalDiag(loc=s_mean,
-                                           scale_diag=jnp.exp(s_log_std))
+    s_mean, s_log_std = get_mean_and_log_std(s_p)
+
+    base_dist = tfd.MultivariateNormalDiag(loc=s_mean, scale_diag=jnp.exp(s_log_std))
 
     bounded_bijector = tfb.Chain([
         tfb.Shift(shift=(d_args['delta_obs_min'] - eps/2)),
         tfb.Scale(scale=(d_args['delta_obs_max'] - d_args['delta_obs_min'] + eps)),
         tfb.Sigmoid(),
     ])
-    dist = tfd.TransformedDistribution(distribution=base_dist,
-                                       bijector=bounded_bijector)
 
+    dist = tfd.TransformedDistribution(distribution=base_dist, bijector=bounded_bijector)
+
+    # negative log likelihood loss
     log_probs = dist.log_prob(d_s)
     loss = jnp.mean(-log_probs)
+
+    # scale loss
     loss /= d_s.shape[-1] 
 
     return loss, {'dynamics_loss': loss}

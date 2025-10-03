@@ -11,7 +11,7 @@ def CLVM_loss(vae_params: Any,
               transitions: Transition,
               key: jnp.ndarray,
               vae_model: Any,
-              controlled_variables: List) -> jnp.ndarray:
+              args: Any) -> jnp.ndarray:
     """
     Compute the loss for the Contextual Latent Variable Model (CLVM), combining
     KL divergence of latent variables and reconstruction loss of actions.
@@ -31,8 +31,8 @@ def CLVM_loss(vae_params: Any,
         JAX PRNG key for stochastic operations.
     vae_model : Any
         CLVM model with an `apply` method.
-    controlled_variables : List[int]
-        Indices of controlled variables in state.
+    args (Any):
+        Configuration object with hyperparameters.
 
     Returns
     -------
@@ -52,7 +52,7 @@ def CLVM_loss(vae_params: Any,
     
     horizon = mask.sum(axis=1).astype(jnp.int32) # (B, 1)
     
-    y_t = transitions.s_tp1[..., controlled_variables]  # (batch_size_per_device, context_len, controlled_variables_dim)
+    y_t = transitions.s_tp1[..., args.controlled_variables_idx]  # (batch_size_per_device, context_len, controlled_variables_dim)
 
     vae_key, dropout_key = jax.random.split(key, 2)
 

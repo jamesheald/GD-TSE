@@ -11,8 +11,6 @@ tfb = tfp.bijectors
 import io
 import imageio
 import wandb
-import hydra
-from omegaconf import DictConfig
 
 from src.networks.networks import posterior, GRU_Precoder
 from src.utils.utils import get_mean_and_log_std, standardise_data
@@ -20,9 +18,9 @@ from src.models.horizon_sampler import sample_time_step
 from src.data import get_dataset
 from src.utils import load_params, get_controlled_variables
 
-cfg_path = os.path.dirname(__file__)
-cfg_path = os.path.join(cfg_path, 'conf')
-@hydra.main(config_path=cfg_path, config_name="config.yaml")
+import hydra
+from omegaconf import DictConfig
+
 def control(args: DictConfig):
 
     def sample_actions(obs, goal_y, key, precoder_params, args, d_args, q_posterior_params, precoder_apply, q_posterior_apply, H_step):
@@ -37,8 +35,8 @@ def control(args: DictConfig):
         obs = jnp.concatenate((obs, obs), axis=-1)
 
         goal_y = standardise_data(goal_y,
-                                  d_args['obs_mean'][args.controlled_variables_idx],
-                                  d_args['obs_std'][args.controlled_variables_idx])
+                                  d_args['obs_mean'][jnp.array(args.controlled_variables_idx)],
+                                  d_args['obs_std'][jnp.array(args.controlled_variables_idx)])
         
         # sample latent action from posterior
         z_dist_params = jax.jit(q_posterior_apply)(q_posterior_params,
@@ -68,15 +66,12 @@ def control(args: DictConfig):
 
         return target_agnostic_obs
 
-    def eval_controller(params, key, minari_env, args, d_args, precoder_apply, q_posterior_apply, loop='closed'):
+    def eval_controller(params, H_step, key, minari_env, args, d_args, precoder_apply, q_posterior_apply, loop='closed'):
 
         key, actions_key = jax.random.split(key)
 
         q_posterior_params = {'params': params['params']['q_posterior']}
         precoder_params = {'params': params['params']['precoder']}
-
-        # H_step = jnp.array(5, dtype=jnp.int32)
-        H_step = None
 
         n_rollouts = args.n_rollouts
         for rollout in range(n_rollouts):
@@ -103,15 +98,16 @@ def control(args: DictConfig):
             video_bytes = io.BytesIO()
             imageio.mimwrite(video_bytes, np.stack(frames, axis=0), format='mp4')
             video_bytes.seek(0)
-            wandb.log({f"video_{loop}_{rollout}/": wandb.Video(video_bytes, format="mp4")})
+            wandb.log({f"video_control_{loop}_loop_HStep_{H_step}_{rollout}/": wandb.Video(video_bytes, format="mp4")})
 
     
-    wandb.init(
-        name=f'{args.env_d4rl_name}-control',
-        group=args.env_d4rl_name,
-        project='GD-TSE-control',
-        config=dict(args)
-    )
+    if wandb.run is None:
+        wandb.init(
+            name=f'{args.env_d4rl_name}-control',
+            group=args.env_d4rl_name,
+            project='GD-TSE-control',
+            config=dict(args)
+        )
 
     args = get_controlled_variables(args)
     _, _, minari_env, _, d_args = get_dataset(args)
@@ -119,13 +115,23 @@ def control(args: DictConfig):
     precoder_apply = GRU_Precoder(args, d_args).apply
     q_posterior_apply = posterior(args, d_args).apply
 
-    model_params = load_params(args.load_CVLM_path)
-
-    args.base_save_path + '/2025-10-02/z50b3fy1/emp_model_1000000.pt'
+    # model_params = load_params(args.load_CVLM_path)
+    model_params = load_params(args.load_control_path)
 
     key = jax.random.PRNGKey(0)
 
-    eval_controller(model_params, key, minari_env, args, d_args, precoder_apply, q_posterior_apply, loop='closed')
+    H_steps = [jnp.array(h, dtype=jnp.int32) for h in [5, 10, 15, 20]] + [None]
+    for H_step in H_steps:
+        eval_controller(model_params, H_step, key, minari_env, args, d_args, precoder_apply, q_posterior_apply, loop='closed')
+
+    return None
+
+cfg_path = os.path.dirname(__file__)
+cfg_path = os.path.join(cfg_path, 'conf')
+@hydra.main(config_path=cfg_path, config_name="config.yaml")
+def main(args: DictConfig):
+
+    control(args)
 
 if __name__ == '__main__':
-    control()
+    main()

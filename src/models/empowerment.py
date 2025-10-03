@@ -21,7 +21,6 @@ class empowerment(nn.Module):
     Attributes:
         args (Any): Configuration object with hyperparameters.
         d_args (Any): Environment-specific arguments (e.g., action dimension).
-        controlled_variables (List[int]): Indices of controlled variables.
         dynamics_apply (Callable): Dynamics model apply function.
 
     Methods:
@@ -44,7 +43,6 @@ class empowerment(nn.Module):
     """
     args: Any
     d_args: Any
-    controlled_variables: List
     dynamics_apply: Any
 
     def setup(self):
@@ -94,7 +92,7 @@ class empowerment(nn.Module):
             dynamics_keys = jax.random.split(key, actions.shape[0])
             next_state, info_gain = self.batch_peform_rollout(s_t[:,0,:], dynamics_keys, actions, dynamics_params)
 
-            y_samp = next_state[...,self.controlled_variables]
+            y_samp = next_state[...,self.args.controlled_variables_idx]
 
             return y_samp, info_gain
 
