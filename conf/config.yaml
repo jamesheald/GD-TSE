@@ -9,8 +9,8 @@ hydra:
 
 base_save_path: /nfs/nhome/live/jheald/jax_dt/checkpoints
 
-# load_dynamics_path: ${base_save_path}/2025-10-02/2r66wgba/dynamics_model_50000.pt
-# load_CVLM_path: ${base_save_path}/2025-10-02/tikrinti/vae_model_50000.pt
+# load_dynamics_path: ${base_save_path}/2025-10-02/6ruqhdo6/dynamics_model_100000.pt
+# load_CVLM_path: ${base_save_path}/2025-10-02/6ruqhdo6/vae_model_100000.pt
 # load_control_path: ${base_save_path}/2025-10-02/6ruqhdo6/emp_model_100000.pt
 
 # load_dynamics_path: ${base_save_path}/2025-09-30/k1p03qj2/dynamics_model_100000.pt
@@ -28,6 +28,7 @@ rtg_target: null
 
 context_len: 20
 gamma: 0.95
+info_gamma: 1.
 
 controlled_variable: obj_pos
 controlled_variables_dim: null

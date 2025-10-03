@@ -134,7 +134,8 @@ class empowerment(nn.Module):
         cum_info_gain = jnp.cumsum(info_gain * mask[:, :, 0], axis=-1)
 
         # gamma discounted cumulative info gain
-        discounted_info_gain = gamma_geom[None] * cum_info_gain
+        info_gamma_geom = self.args.info_gamma ** jnp.arange(self.args.context_len)
+        discounted_info_gain = info_gamma_geom[None] * cum_info_gain
 
         # mean across batch
         info_gain_loss = discounted_info_gain.mean()

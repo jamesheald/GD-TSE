@@ -37,7 +37,7 @@ def train(args: DictConfig):
     key = jax.random.PRNGKey(seed)
 
     wandb_run = wandb.init(
-        name=f'{args.env_d4rl_name}-{random.randint(int(1e5), int(1e6) - 1)}',
+        # name=f'{args.env_d4rl_name}-{random.randint(int(1e5), int(1e6) - 1)}',
         group=args.env_d4rl_name,
         project='GD-TSE-train',
         config=dict(args)
@@ -243,7 +243,7 @@ def train(args: DictConfig):
 
     ###################################### evaluate control ###################################### 
 
-    # use the last saved (most trained) model to evaluate control
+    # use the last saved (trained) model to evaluate control
     args.load_control_path = save_current_model_path
     control(args)
 
