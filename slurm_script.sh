@@ -34,6 +34,6 @@ export TF_CPP_MIN_LOG_LEVEL=0
 echo "Active conda env: $CONDA_PREFIX"
 which python3
 which pip
-python3 -u /nfs/nhome/live/jheald/jax_dt/train_dt.py "$@"
+python3 -u /nfs/nhome/live/jheald/jax_dt/train.py "$@"
 
 rm -rf /tmp/.bashrc
