@@ -23,7 +23,7 @@ from omegaconf import DictConfig
 
 def control(args: DictConfig):
 
-    def sample_actions(obs, goal_y, key, precoder_params, args, d_args, q_posterior_params, precoder_apply, q_posterior_apply, H_step):
+    def sample_actions(prev_obs, obs, initial_obs, goal_y, key, precoder_params, args, d_args, q_posterior_params, precoder_apply, q_posterior_apply, H_step):
 
         sample_z_key, H_step_key, posterior_key = jax.random.split(key, 3)
 
@@ -31,8 +31,12 @@ def control(args: DictConfig):
             logits = jnp.arange(args.context_len) * jnp.log(args.gamma)
             H_step = sample_time_step(logits, args.context_len, args.context_len, H_step_key)
 
-        obs = standardise_data(obs, d_args['obs_mean'], d_args['obs_std'])
-        obs = jnp.concatenate((obs, obs), axis=-1)
+        target_agnostic_prev_obs = remove_task_info_from_goal(prev_obs, initial_obs)
+        target_agnostic_obs = remove_task_info_from_goal(obs, initial_obs)
+
+        prev_obs = standardise_data(target_agnostic_prev_obs, d_args['obs_mean'], d_args['obs_std'])
+        obs = standardise_data(target_agnostic_obs, d_args['obs_mean'], d_args['obs_std'])
+        obs = jnp.concatenate((prev_obs, obs), axis=-1)
 
         goal_y = standardise_data(goal_y,
                                   d_args['obs_mean'][jnp.array(args.controlled_variables_idx)],
@@ -79,15 +83,15 @@ def control(args: DictConfig):
             done = False
             obs, _ = minari_env.reset()
             initial_obs = obs.copy()
-            target_agnostic_obs = remove_task_info_from_goal(obs, initial_obs)
+            prev_obs = obs.copy()
             goal_y = -initial_obs[33:36] # target_pos - palm_pos_0; target_agnostic_obs[36:39] - obs[36:39] # obj_pos - palm_pos_0 - (obj_pos - target_pos) = target_pos - palm_pos_0
             while not done:
 
-                target_agnostic_obs = remove_task_info_from_goal(obs, initial_obs)
-                actions = sample_actions(target_agnostic_obs, goal_y, actions_key, precoder_params, args, d_args, q_posterior_params, precoder_apply, q_posterior_apply, H_step)
+                actions = sample_actions(prev_obs, obs, initial_obs, goal_y, actions_key, precoder_params, args, d_args, q_posterior_params, precoder_apply, q_posterior_apply, H_step)
 
                 for action in actions:
                     frames.append(minari_env.render())
+                    prev_obs = obs.copy()
                     obs, rew, terminated, truncated, info = minari_env.step(action)
                     if terminated or truncated:
                         done = True
